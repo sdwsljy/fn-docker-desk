@@ -1,0 +1,15 @@
+#!/bin/bash
+# 飞牛桌面图标 - 卸载后处理
+# 温和卸载：移除注入与自启服务，用户图标配置先备份到持久卷（升级场景可恢复）
+DEST_DIR="/usr/fn-docker-desk"
+if [ -f "$DEST_DIR/fn-docker-desk.sh" ]; then
+    bash "$DEST_DIR/fn-docker-desk.sh" uninstall 2>/dev/null || true
+fi
+# 清理 web 托管 systemd 单元（兜底，主脚本已处理）
+systemctl stop fn-docker-desk-web.service 2>/dev/null || true
+systemctl disable fn-docker-desk-web.service 2>/dev/null || true
+rm -f /etc/systemd/system/fn-docker-desk-web.service 2>/dev/null || true
+systemctl daemon-reload 2>/dev/null || true
+# 说明：用户配置已备份到 @appdata 持久卷，重装/升级后自动恢复；此处保留目录避免误删
+rm -rf "$DEST_DIR/backup" 2>/dev/null || true
+exit 0

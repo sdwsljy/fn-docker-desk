@@ -1,0 +1,13 @@
+* text=auto
+
+*.sh text eol=lf
+*.py text eol=lf
+*.cgi text eol=lf
+pkg/fnos/cmd/* text eol=lf
+pkg/fnos/config/* text eol=lf
+pkg/fnos/manifest text eol=lf
+pkg/fnos/ui/config text eol=lf
+
+*.png binary
+*.PNG binary
+*.fpk binary

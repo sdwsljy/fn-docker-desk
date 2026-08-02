@@ -1,0 +1,26 @@
+#!/bin/bash
+# 飞牛桌面图标 - 升级后处理
+# 升级后复制工具文件、自动恢复用户配置（从 @appdata 持久卷）、重新注入并确保 Web 服务
+DEST_DIR="/usr/fn-docker-desk"
+SVC_PORT="${TRIM_SERVICE_PORT:-5558}"
+if [ -d "$TRIM_APPDEST" ]; then
+    mkdir -p "$DEST_DIR"
+    cp -f "$TRIM_APPDEST"/fn-docker-desk.sh "$DEST_DIR/" 2>/dev/null || true
+    cp -f "$TRIM_APPDEST"/web.py "$DEST_DIR/" 2>/dev/null || true
+    chmod +x "$DEST_DIR/fn-docker-desk.sh" 2>/dev/null || true
+fi
+if [ -f "$DEST_DIR/fn-docker-desk.sh" ]; then
+    # apply 内部会先从 @appdata 持久卷恢复用户配置，再发布+注入
+    bash "$DEST_DIR/fn-docker-desk.sh" apply --quiet 2>/dev/null || true
+fi
+# 启动 Web 管理服务（优先 systemd 托管，失败再 nohup）
+if ! systemctl is-active fn-docker-desk-web.service >/dev/null 2>&1; then
+    if systemctl list-unit-files fn-docker-desk-web.service >/dev/null 2>&1; then
+        systemctl start fn-docker-desk-web.service 2>/dev/null || true
+    fi
+fi
+if [ -f "$DEST_DIR/web.py" ] && ! pgrep -f "web.py --port ${SVC_PORT}" >/dev/null 2>&1; then
+    nohup python3 -u "$DEST_DIR/web.py" --port "$SVC_PORT" \
+        >/var/log/fn-docker-desk-web.log 2>&1 &
+fi
+exit 0

@@ -1,0 +1,15 @@
+{
+    ".url": {
+        "fn-docker-desk.Application":
+        {
+            "title": "飞牛桌面图标",
+            "desc": "Docker 桌面图标管理",
+            "icon": "images/icon_{0}.png",
+            "type": "iframe",
+            "port": "5558",
+            "protocol": "http",
+            "url": "/",
+            "allUsers": true
+        }
+    }
+}

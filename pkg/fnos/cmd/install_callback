@@ -1,0 +1,19 @@
+#!/bin/bash
+# 飞牛桌面图标 - 安装后处理
+# 复制工具文件、注入桌面并启动 Web 管理服务，避免应用中心打开时端口未启动。
+DEST_DIR="/usr/fn-docker-desk"
+SVC_PORT="${TRIM_SERVICE_PORT:-5558}"
+mkdir -p "$DEST_DIR"
+if [ -d "$TRIM_APPDEST" ]; then
+    cp -f "$TRIM_APPDEST"/fn-docker-desk.sh "$DEST_DIR/" 2>/dev/null || true
+    cp -f "$TRIM_APPDEST"/web.py "$DEST_DIR/" 2>/dev/null || true
+    chmod +x "$DEST_DIR/fn-docker-desk.sh" 2>/dev/null || true
+fi
+if [ -f "$DEST_DIR/fn-docker-desk.sh" ]; then
+    bash "$DEST_DIR/fn-docker-desk.sh" apply --quiet 2>/dev/null || true
+fi
+if [ -f "$DEST_DIR/web.py" ] && ! pgrep -f "web.py --port ${SVC_PORT}" >/dev/null 2>&1; then
+    nohup python3 -u "$DEST_DIR/web.py" --port "$SVC_PORT" \
+        >/var/log/fn-docker-desk-web.log 2>&1 &
+fi
+exit 0

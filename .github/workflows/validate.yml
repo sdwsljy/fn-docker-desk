@@ -1,0 +1,30 @@
+name: validate
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Check Python syntax
+        run: python -m py_compile pkg/files/web.py scripts/build_fpk.py
+
+      - name: Check shell syntax
+        run: bash -n pkg/files/fn-docker-desk.sh fn-docker-desk.sh
+
+      - name: Build fpk
+        if: ${{ hashFiles('pkg/fnos/ICON.PNG', 'pkg/fnos/ICON_256.PNG', 'pkg/fnos/ui/images/icon_64.png', 'pkg/fnos/ui/images/icon_256.png') != '' }}
+        run: python scripts/build_fpk.py

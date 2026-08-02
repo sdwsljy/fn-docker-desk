@@ -1,0 +1,44 @@
+#!/bin/bash
+# 飞牛桌面图标 - 应用生命周期管理
+# 说明：应用安装后（install_type=root），工具文件位于 TRIM_APPDEST
+#       （/usr/local/apps/@appcenter/fn-docker-desk/target），启动时
+#       初始化到 /usr/fn-docker-desk/ 并启动 Web 管理服务。
+DEST_DIR="/usr/fn-docker-desk"
+SVC_PORT="${TRIM_SERVICE_PORT:-5558}"
+
+case $1 in
+start)
+    # 1. 初始化工具文件（幂等）
+    mkdir -p "$DEST_DIR"
+    if [ -d "$TRIM_APPDEST" ]; then
+        cp -f "$TRIM_APPDEST"/fn-docker-desk.sh "$DEST_DIR/" 2>/dev/null || true
+        cp -f "$TRIM_APPDEST"/web.py "$DEST_DIR/" 2>/dev/null || true
+        chmod +x "$DEST_DIR/fn-docker-desk.sh" 2>/dev/null || true
+    fi
+    # 2. 应用桌面注入（v0.3：patch fnOS Web 源包，幂等；升级后自动从持久卷恢复配置）
+    if [ -f "$DEST_DIR/fn-docker-desk.sh" ]; then
+        bash "$DEST_DIR/fn-docker-desk.sh" apply --quiet || true
+    fi
+    # 3. 启动 Web 管理服务
+    if ! pgrep -f "web.py --port ${SVC_PORT}" >/dev/null 2>&1; then
+        nohup python3 -u "$DEST_DIR/web.py" --port "$SVC_PORT" \
+            >/var/log/fn-docker-desk-web.log 2>&1 &
+        sleep 1
+    fi
+    exit 0
+    ;;
+stop)
+    pkill -f "web.py --port ${SVC_PORT}" 2>/dev/null || true
+    exit 0
+    ;;
+status)
+    if pgrep -f "web.py --port ${SVC_PORT}" >/dev/null 2>&1; then
+        exit 0
+    else
+        exit 3
+    fi
+    ;;
+*)
+    exit 1
+    ;;
+esac
