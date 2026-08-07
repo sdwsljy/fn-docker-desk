@@ -69,20 +69,50 @@
     d.appendChild(cover);
     return d;
   }
+  // ---- 防闪烁机制 ----
+  var rendering=false;       // 防止重入
+  var lastSig='';            // 数据签名，跳过无变化的重渲染
+  var observer=null;         // MutationObserver 实例（渲染期间暂停）
+  function dataSig(data){
+    // 生成数据指纹，用于判断是否需要重渲染
+    return data.map(function(it){return (it['序号']||0)+'|'+(it['标题']||'')+'|'+(it['跳转URL']||'')+'|'+(it['图片URL']||'');}).join(';;');
+  }
   function render(){
     if(location.pathname.indexOf('/login')===0)return;
+    if(rendering)return;          // 防重入
+    rendering=true;
     loadIcons().then(function(data){
-      if(!Array.isArray(data)||!data.length)return;
-      var t=findTarget(); if(!t){console.warn('fn-docker-desk: desktop container not found'); return;}
+      if(!Array.isArray(data)||!data.length){rendering=false;return;}
+      var sig=dataSig(data);
+      if(sig===lastSig){rendering=false;return;}  // 数据无变化，跳过
+      var t=findTarget(); if(!t){rendering=false;console.warn('fn-docker-desk: desktop container not found'); return;}
+      // 暂停 Observer，避免自身 DOM 操作触发循环
+      if(observer){try{observer.disconnect();}catch(e){}}
       var old=t.querySelectorAll('['+MARK+']'); for(var i=0;i<old.length;i++)old[i].remove();
       data.sort(function(a,b){return(a['序号']||0)-(b['序号']||0);});
-      data.forEach(function(item,idx){
-        t.appendChild(buildItem(item,idx));
-      });
+      // 使用 DocumentFragment 批量插入，减少重排次数
+      var frag=document.createDocumentFragment();
+      data.forEach(function(item,idx){frag.appendChild(buildItem(item,idx));});
+      t.appendChild(frag);
+      lastSig=sig;
+      // 恢复 Observer
+      if(observer){try{observer.observe(document.getElementById('root')||document.body,{childList:true,subtree:true});}catch(e){}}
       window.__fnDeskDiag={ok:true,count:data.length,targetClass:String(t.className||''),ts:Date.now()};
-    }).catch(function(e){console.error('fn-docker-desk:',e); window.__fnDeskDiag={ok:false,err:String(e),ts:Date.now()};});
+    }).catch(function(e){console.error('fn-docker-desk:',e); window.__fnDeskDiag={ok:false,err:String(e),ts:Date.now()};})
+      .finally(function(){rendering=false;});
   }
-  var timer=null; function schedule(){clearTimeout(timer); timer=setTimeout(render,250);}
-  function start(){try{new MutationObserver(schedule).observe(document.getElementById('root')||document.body,{childList:true,subtree:true});}catch(e){} schedule(); var n=0;(function wait(){render(); if(++n<180)setTimeout(wait,1000);})();}
+  var timer=null; function schedule(){clearTimeout(timer); timer=setTimeout(render,400);}
+  function start(){
+    try{observer=new MutationObserver(schedule); observer.observe(document.getElementById('root')||document.body,{childList:true,subtree:true});}catch(e){}
+    schedule();
+    // 智能轮询：前 5 次每秒尝试（覆盖桌面异步加载），成功后降频到每 10 秒保活
+    var n=0;
+    (function wait(){
+      render();
+      n++;
+      if(n<5){setTimeout(wait,1000);}
+      else{setInterval(render,10000);}
+    })();
+  }
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start); else start();
 })();
