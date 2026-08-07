@@ -26,7 +26,7 @@ class TestReadManifestVersion:
 
     def test_version_matches_expected(self, build_module):
         version = build_module.read_manifest_version()
-        assert version == "1.0.8"
+        assert version == "1.0.9"
 
 
 # ==================== build_app_tgz ====================
@@ -68,13 +68,13 @@ class TestBuildFpk:
     def test_build_fpk_creates_valid_package(self, build_module, tmp_path, monkeypatch):
         # 重定向 DIST 到临时目录
         monkeypatch.setattr(build_module, "DIST", tmp_path)
-        package = build_module.build_fpk("1.0.8")
+        package = build_module.build_fpk("1.0.9")
         assert package.exists()
-        assert package.name == "fn-docker-desk_1.0.8_all.fpk"
+        assert package.name == "fn-docker-desk_1.0.9_all.fpk"
 
     def test_fpk_contains_manifest_and_icons(self, build_module, tmp_path, monkeypatch):
         monkeypatch.setattr(build_module, "DIST", tmp_path)
-        package = build_module.build_fpk("1.0.8")
+        package = build_module.build_fpk("1.0.9")
 
         with tarfile.open(package, "r:gz") as tar:
             names = tar.getnames()
@@ -91,7 +91,7 @@ class TestBuildFpk:
 
     def test_fpk_cmd_scripts_are_executable(self, build_module, tmp_path, monkeypatch):
         monkeypatch.setattr(build_module, "DIST", tmp_path)
-        package = build_module.build_fpk("1.0.8")
+        package = build_module.build_fpk("1.0.9")
 
         executable_names = {
             "main", "install_init", "install_callback",
@@ -109,7 +109,7 @@ class TestBuildFpk:
         monkeypatch.setattr(build_module, "DIST", tmp_path)
         # 不传 version 参数时，应从 manifest 读取
         package = build_module.build_fpk(build_module.read_manifest_version())
-        assert "1.0.8" in package.name
+        assert "1.0.9" in package.name
 
 
 # ==================== 打包一致性 ====================
@@ -119,7 +119,7 @@ class TestPackageConsistency:
 
     def test_manifest_in_fpk_matches_source(self, build_module, tmp_path, monkeypatch):
         monkeypatch.setattr(build_module, "DIST", tmp_path)
-        package = build_module.build_fpk("1.0.8")
+        package = build_module.build_fpk("1.0.9")
 
         source_manifest = (FNOS / "manifest").read_text(encoding="utf-8")
         with tarfile.open(package, "r:gz") as tar:
@@ -128,7 +128,7 @@ class TestPackageConsistency:
 
     def test_no_pycache_in_package(self, build_module, tmp_path, monkeypatch):
         monkeypatch.setattr(build_module, "DIST", tmp_path)
-        package = build_module.build_fpk("1.0.8")
+        package = build_module.build_fpk("1.0.9")
 
         with tarfile.open(package, "r:gz") as tar:
             for name in tar.getnames():

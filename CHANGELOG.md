@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.9
+- 修复管理面板 JavaScript 语法错误：`onerror` 属性中的单引号转义在 Python 原始字符串中丢失反斜杠，导致 `SyntaxError: Unexpected identifier 'none'`，管理面板无法加载容器和图标数据
+- 改用 HTML 实体 `&#39;` 替代 JavaScript 转义 `\'`，彻底解决跨语言字符串转义问题
+
 ## 1.0.8
 
 - 修复 1.0.7 降权运行导致的严重问题：
