@@ -45,6 +45,7 @@ BACKUP_DIR = "/usr/fn-docker-desk/backup"
 ICON_DIR = "/usr/fn-docker-desk/icons"
 LOG_FILE = "/var/log/fn-docker-desk.log"
 DEFAULT_PORT = 5558
+APP_VERSION = "1.0.6"
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -177,7 +178,7 @@ PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>飞牛桌面图标 - 管理面板 v1.0.6</title>
+<title>飞牛桌面图标 - 管理面板 v""" + APP_VERSION + """</title>
 <style>
 :root {
   --bg0:#070a10; --bg1:#0a0f17; --panel:#0c131f;

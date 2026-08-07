@@ -26,6 +26,7 @@
 set -euo pipefail
 
 # ---------------- 路径与常量 ----------------
+readonly APP_VERSION="1.0.6"                     # 应用版本（与 manifest 保持一致）
 readonly FN_WWW="/usr/trim/www"                 # 飞牛 Web 根目录
 readonly INDEX_HTML="${FN_WWW}/index.html"
 readonly CONF_DIR="/usr/fn-docker-desk"          # 工具配置目录（root 专属，不受 www 重建影响）
@@ -37,11 +38,13 @@ readonly BACKUP_DIR="${CONF_DIR}/backup"         # index.html 备份
 readonly LOG_FILE="/var/log/fn-docker-desk.log"  # 操作日志（排障用）
 readonly APPDATA_DIR="${TRIM_APPDEST_VOL:-/usr/local/apps/@appdata}/fn-docker-desk"  # 持久卷备份（升级/卸载保留）
 readonly RESTORED_FLAG="${CONF_DIR}/.restored"    # 还原态标记：一键还原后阻止自动注入/生成图标
+readonly INJECT_JS_FILE="${CONF_DIR}/desktop-inject.js"  # 桌面注入 JS（独立文件，便于维护）
 readonly MARKER_START="<!-- fn-docker-desk:start -->"
 readonly MARKER_END="<!-- fn-docker-desk:end -->"
 readonly SERVICE_NAME="fn-docker-desk.service"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 readonly RESTORE_SCRIPT="/usr/local/bin/fn-docker-desk-restore.sh"
+readonly APP_USER="${TRIM_USERNAME:-fn-docker-desk}"  # 专用包用户（web.py 降权运行）
 
 # 内置常见应用的图标 URL 映射（键为镜像名关键字，值为图标 URL）
 declare -A ICON_MAP=(
@@ -107,6 +110,10 @@ init_dirs() {
     mkdir -p "${CONF_DIR}" "${IMAGE_DIR}" "${BACKUP_DIR}"
     chmod -R 755 "${CONF_DIR}"
     [ -f "${CONF_JSON}" ] || echo '[]' > "${CONF_JSON}"
+    # 以 root 运行时，将配置目录归属包用户（web.py 降权后需读写）
+    if [ "$(id -u)" -eq 0 ] && id "${APP_USER}" >/dev/null 2>&1; then
+        chown -R "${APP_USER}:${APP_USER}" "${CONF_DIR}" 2>/dev/null || true
+    fi
 }
 
 # 获取 NAS 局域网 IP
@@ -252,42 +259,6 @@ SVGEOF
     echo "icons/${name}.svg"
 }
 
-# 生成管理面板桌面快捷方式（兜底：fnOS 未自动生成应用图标时仍可从桌面进入）
-ensure_manager_icon() {
-    local nas_ip url img_rel
-    init_dirs
-    nas_ip="$(get_nas_ip)"
-    url="http://${nas_ip}:5558/"
-    img_rel="icons/fn-docker-desk-manager.svg"
-
-    mkdir -p "${IMAGE_DIR}"
-    cat > "${IMAGE_DIR}/fn-docker-desk-manager.svg" <<'SVGEOF'
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
-  <defs>
-    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#1677ff"/>
-      <stop offset="100%" stop-color="#13c2c2"/>
-    </linearGradient>
-  </defs>
-  <rect width="256" height="256" rx="54" fill="url(#g)"/>
-  <path d="M68 85h120a14 14 0 0 1 14 14v58a14 14 0 0 1-14 14H68a14 14 0 0 1-14-14V99a14 14 0 0 1 14-14Z" fill="rgba(255,255,255,.18)" stroke="rgba(255,255,255,.65)" stroke-width="10"/>
-  <path d="M83 108h90M83 132h58M83 156h74" stroke="#fff" stroke-width="12" stroke-linecap="round"/>
-  <circle cx="185" cy="107" r="9" fill="#fff"/>
-</svg>
-SVGEOF
-    chmod 644 "${IMAGE_DIR}/fn-docker-desk-manager.svg" 2>/dev/null || true
-
-    if ! jq -e 'any(.[]; ."类型" == "manager" or ."标题" == "飞牛桌面图标")' "${CONF_JSON}" >/dev/null 2>&1; then
-        jq --arg title "飞牛桌面图标" --arg url "${url}" --arg img "${img_rel}" \
-           '. + [{"序号": 0, "标题": $title, "跳转URL": $url, "图片URL": $img, "容器名": "", "类型": "manager"}]' \
-           "${CONF_JSON}" > "${CONF_JSON}.tmp" && mv "${CONF_JSON}.tmp" "${CONF_JSON}"
-    else
-        jq --arg title "飞牛桌面图标" --arg url "${url}" --arg img "${img_rel}" \
-           'map(if (."类型" == "manager" or ."标题" == $title) then . + {"序号": 0, "跳转URL": $url, "图片URL": $img, "类型": "manager"} else . end)' \
-           "${CONF_JSON}" > "${CONF_JSON}.tmp" && mv "${CONF_JSON}.tmp" "${CONF_JSON}"
-    fi
-}
-
 # 查找容器：支持名称或 ID 前缀
 resolve_container() {
     local query="$1" found
@@ -380,10 +351,22 @@ PYEOF
     cp "${INDEX_HTML}" "${tmproot}/index.html"
     cp "${FN_WWW}/${asset}" "${tmproot}/${asset}"
 
-    if ! python3 - "${tmproot}/index.html" "${tmproot}/${asset}" <<'PYEOF'
+    # 读取注入 JS（优先独立文件，回退脚本同目录）
+    local inject_src=""
+    if [ -f "${INJECT_JS_FILE}" ]; then
+        inject_src="${INJECT_JS_FILE}"
+    elif [ -f "$(dirname "${BASH_SOURCE[0]:-$0}")/desktop-inject.js" ]; then
+        inject_src="$(dirname "${BASH_SOURCE[0]:-$0}")/desktop-inject.js"
+    else
+        log_warn "未找到注入 JS 文件: ${INJECT_JS_FILE}，跳过注入"
+        return 1
+    fi
+    if ! python3 - "${tmproot}/index.html" "${tmproot}/${asset}" "${inject_src}" "${APP_VERSION}" <<'PYEOF'
 import pathlib, re, sys
 index = pathlib.Path(sys.argv[1])
 asset = pathlib.Path(sys.argv[2])
+inject_file = pathlib.Path(sys.argv[3])
+app_version = sys.argv[4]
 idx = index.read_text('utf-8', errors='replace')
 idx = re.sub(r'src="(/assets/index-[^"?]+\.js)(?:\?[^"]*)?"',
              r'src="\1?v=fndesk14"', idx, count=1)
@@ -391,94 +374,8 @@ index.write_text(idx, 'utf-8')
 
 js = asset.read_text('utf-8', errors='replace')
 js = re.split(r';/\* fn-docker-desk asset injection v[01]\.[0-9.]+ \*/', js)[0].rstrip()
-inject = r""";/* fn-docker-desk asset injection v1.0.6 */
-(function(){
-  if(window.__fnDockerDeskLoaded)return; window.__fnDockerDeskLoaded=true;
-  var MARK='data-fndesk-icon';
-  var EMBED=[];
-  function dataIcon(title){var ch=String(title||'D').trim().charAt(0).toUpperCase()||'D';return 'data:image/svg+xml;charset=utf-8,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#1677ff"/><stop offset="100%" stop-color="#13c2c2"/></linearGradient></defs><rect width="256" height="256" rx="48" fill="url(#g)"/><text x="128" y="132" font-family="Arial,sans-serif" font-size="104" font-weight="700" fill="#fff" text-anchor="middle" dominant-baseline="middle">'+ch+'</text></svg>');}
-  function loadIcons(){
-    return fetch('/userimg/fn-docker-desk.json?t='+Date.now(),{cache:'no-store'}).then(function(r){if(!r.ok)throw new Error('local '+r.status);return r.json();})
-      .catch(function(){return fetch(location.protocol+'//'+location.hostname+':5558/api/icons?t='+Date.now(),{cache:'no-store'}).then(function(r){if(!r.ok)throw new Error('api '+r.status);return r.json();}).then(function(d){return d.list||d;});})
-      .catch(function(){return EMBED;}).then(function(data){
-        // 过滤管理面板自身图标（由 fnOS 应用中心管理，避免重复/重复管理）
-        if(Array.isArray(data)){data=data.filter(function(it){return it&&it['类型']!=='manager'&&it['标题']!=='飞牛桌面图标';});}
-        return data;
-      });
-  }
-  function findTarget(){
-    var sels=['.box-border.flex.size-full.flex-col.flex-wrap.place-content-start.items-start.py-base-loose','.relative.box-border.h-full.pl-\\[66px\\] .flex.flex-col.flex-wrap','.desktop .box-border.flex.flex-col.flex-wrap','.trim-ui__app-layout--window .box-border.flex.flex-wrap'];
-    for(var i=0;i<sels.length;i++){try{var a=document.querySelectorAll(sels[i]); if(a&&a.length)return a[a.length-1];}catch(e){}}
-    var all=document.querySelectorAll('div'), best=null, score=0;
-    for(var j=0;j<all.length;j++){var el=all[j], cls=String(el.className||''), s=0; if(cls.indexOf('login-form')>=0)continue; if(cls.indexOf('flex')>=0)s++; if(cls.indexOf('wrap')>=0)s+=2; if(cls.indexOf('size-full')>=0||cls.indexOf('h-full')>=0)s++; try{var cs=getComputedStyle(el); if(cs.display.indexOf('flex')>=0)s++; if(cs.flexWrap==='wrap')s+=2;}catch(e){} for(var k=0;k<el.children.length;k++){var c=el.children[k]; if(c.tagName==='A'&&(c.querySelector('img')||c.querySelector('svg')))s+=3; if(c.getAttribute&&(c.getAttribute('data-desktop-item-id')||c.getAttribute('data-testid')))s+=3;} if(s>score){best=el;score=s;}}
-    return score>=3?best:null;
-  }
-  function esc(x){return String(x==null?'':x).replace(/[&<>"']/g,function(c){return({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];});}
-  function normalizeImg(item){
-    var img=item['图片URL']||'';
-    if(!img)return dataIcon(item['标题']||item.title||'D');
-    if(img.indexOf('icons/')===0)return location.protocol+'//'+location.hostname+':5558/'+img;
-    if(img.indexOf('userimg/')===0||img.indexOf('/userimg/')===0)return '/'+img.replace(/^\/+/,'');
-    return img;
-  }
-  // 完全复刻 fnOS 原生桌面图标结构（源码：div h-[120px] w-[144px] pt-[22px]，图标 52px，标题 14px/18px）
-  // 保证尺寸、边距、对齐与系统图标完全一致
-  function buildItem(item,seq){
-    var d=document.createElement('div');
-    d.setAttribute(MARK,'1');
-    d.setAttribute('data-desktop-item-id','fndesk-'+seq);
-    d.className='box-border flex h-[120px] w-[144px] cursor-default select-none flex-col items-center gap-[10px] rounded-xl pt-[22px]';
-    d.title=item['标题']||'';
-    d.style.position='relative';
-    var inner=document.createElement('div');
-    inner.className='inline-flex cursor-pointer flex-col items-center gap-[10px]';
-    inner.setAttribute('data-desktop-item-context-hotspot','true');
-    var iconBox=document.createElement('div');
-    iconBox.className='relative flex size-[52px] shrink-0 flex-row items-center justify-center transition-all duration-150';
-    var iconWrap=document.createElement('div');
-    iconWrap.className='absolute inset-0 overflow-hidden';
-    var img=document.createElement('img');
-    img.className='!h-[52px] !w-[52px] !p-0';
-    img.src=normalizeImg(item);
-    img.alt=item['标题']||'';
-    img.onerror=function(){this.onerror=null;this.src=dataIcon(item['标题']||item.title||'D');};
-    iconWrap.appendChild(img);
-    iconBox.appendChild(iconWrap);
-    var tWrap=document.createElement('div');
-    tWrap.className='flex min-h-base w-fit max-w-[128px] shrink-0 items-start justify-center';
-    var tDiv=document.createElement('div');
-    tDiv.className='line-clamp-2 max-w-[128px] break-words shrink-0 text-center align-top text-[14px] font-bold leading-[18px] text-white';
-    tDiv.textContent=item['标题']||'';
-    tWrap.appendChild(tDiv);
-    inner.appendChild(iconBox);
-    inner.appendChild(tWrap);
-    d.appendChild(inner);
-    // 透明 <a> 覆盖层：浏览器原生导航打开链接，避免 window.open 被弹窗拦截导致点击无反应
-    var cover=document.createElement('a');
-    cover.href=item['跳转URL']||item.url||'#';
-    cover.target='_blank';
-    cover.rel='noopener';
-    cover.style.cssText='position:absolute;inset:0;z-index:5;';
-    d.appendChild(cover);
-    return d;
-  }
-  function render(){
-    if(location.pathname.indexOf('/login')===0)return;
-    loadIcons().then(function(data){
-      if(!Array.isArray(data)||!data.length)return;
-      var t=findTarget(); if(!t){console.warn('fn-docker-desk: desktop container not found'); return;}
-      var old=t.querySelectorAll('['+MARK+']'); for(var i=0;i<old.length;i++)old[i].remove();
-      data.sort(function(a,b){return(a['序号']||0)-(b['序号']||0);});
-      data.forEach(function(item,idx){
-        t.appendChild(buildItem(item,idx));
-      });
-      window.__fnDeskDiag={ok:true,count:data.length,targetClass:String(t.className||''),ts:Date.now()};
-    }).catch(function(e){console.error('fn-docker-desk:',e); window.__fnDeskDiag={ok:false,err:String(e),ts:Date.now()};});
-  }
-  var timer=null; function schedule(){clearTimeout(timer); timer=setTimeout(render,250);}
-  function start(){try{new MutationObserver(schedule).observe(document.getElementById('root')||document.body,{childList:true,subtree:true});}catch(e){} schedule(); var n=0;(function wait(){render(); if(++n<180)setTimeout(wait,1000);})();}
-  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start); else start();
-})();"""
+inject = inject_file.read_text('utf-8', errors='replace')
+inject = inject.replace('__VERSION__', app_version)
 asset.write_text(js + "\n" + inject + "\n", 'utf-8')
 PYEOF
     then
@@ -554,21 +451,32 @@ set -euo pipefail
 if [ -f "${CONF_DIR}/fn-docker-desk.sh" ]; then
     bash "${CONF_DIR}/fn-docker-desk.sh" apply --quiet || true
 fi
-# 确保 Web 管理服务运行（5558）
+# 确保 Web 管理服务运行（降权运行，回退 root）
 if [ -f "${CONF_DIR}/web.py" ] && ! pgrep -f "web.py --port ${SVC_PORT:-5558}" >/dev/null 2>&1; then
-    setsid nohup python3 -u "${CONF_DIR}/web.py" --port ${SVC_PORT:-5558} >>/var/log/fn-docker-desk-web.log 2>&1 < /dev/null &
+    touch /var/log/fn-docker-desk-web.log 2>/dev/null || true
+    chmod 644 /var/log/fn-docker-desk-web.log 2>/dev/null || true
+    if id "${APP_USER}" >/dev/null 2>&1; then
+        chown -R "${APP_USER}:${APP_USER}" "${CONF_DIR}" 2>/dev/null || true
+        setsid runuser -u "${APP_USER}" -- python3 -u "${CONF_DIR}/web.py" --port ${SVC_PORT:-5558} >>/var/log/fn-docker-desk-web.log 2>&1 < /dev/null &
+    else
+        setsid nohup python3 -u "${CONF_DIR}/web.py" --port ${SVC_PORT:-5558} >>/var/log/fn-docker-desk-web.log 2>&1 < /dev/null &
+    fi
 fi
 EOF
     chmod +x "${RESTORE_SCRIPT}"
 
     # 把主脚本复制到配置目录（保证还原脚本能找到）
-    if [ -f "${BASH_SOURCE[0]}" ] && [ ! -f "${CONF_DIR}/fn-docker-desk.sh" ]; then
-        cp "${BASH_SOURCE[0]}" "${CONF_DIR}/fn-docker-desk.sh"
+    if [ -f "${BASH_SOURCE[0]:-$0}" ]; then
+        cp -f "${BASH_SOURCE[0]:-$0}" "${CONF_DIR}/fn-docker-desk.sh"
         chmod +x "${CONF_DIR}/fn-docker-desk.sh"
     fi
     # 同步最新 web.py 到配置目录
-    if [ -f "${BASH_SOURCE[0]}" ] && [ -f "$(dirname "${BASH_SOURCE[0]}")/web.py" ]; then
-        cp -f "$(dirname "${BASH_SOURCE[0]}")/web.py" "${CONF_DIR}/web.py" 2>/dev/null || true
+    if [ -f "$(dirname "${BASH_SOURCE[0]:-$0}")/web.py" ]; then
+        cp -f "$(dirname "${BASH_SOURCE[0]:-$0}")/web.py" "${CONF_DIR}/web.py" 2>/dev/null || true
+    fi
+    # 同步注入 JS 到配置目录
+    if [ -f "$(dirname "${BASH_SOURCE[0]:-$0}")/desktop-inject.js" ]; then
+        cp -f "$(dirname "${BASH_SOURCE[0]:-$0}")/desktop-inject.js" "${INJECT_JS_FILE}" 2>/dev/null || true
     fi
 
     # systemd 服务
