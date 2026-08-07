@@ -153,6 +153,7 @@ fn-docker-desk_1.0.6_all.fpk (tar.gz)
 ├── app.tgz               # 应用文件，解压到 target（含 ui/config 桌面入口注册）
 │   ├── fn-docker-desk.sh
 │   ├── web.py
+│   ├── desktop-inject.js
 │   └── ui/
 │       ├── config        # 桌面入口（desktop_applaunchname 对应）
 │       └── images/       # icon_64.png / icon_256.png
@@ -169,11 +170,67 @@ python scripts/build_fpk.py
 
 脚本只依赖 Python 标准库，输出文件位于 `dist/fn-docker-desk_1.0.6_all.fpk`。
 
+## 开发与测试
+
+### 项目结构
+
+```
+fn-docker-desk/
+├── pkg/files/               # 应用核心文件（打包进 app.tgz）
+│   ├── fn-docker-desk.sh    # 主脚本（容器发现/图标提取/桌面注入/还原）
+│   ├── web.py               # Web 管理面板后端（Python 标准库）
+│   └── desktop-inject.js    # 桌面注入 JS（独立文件，便于维护）
+├── pkg/fnos/                # fnOS 应用配置
+│   ├── manifest             # 应用清单
+│   ├── cmd/                 # 生命周期脚本（main/install_*/upgrade_*/uninstall_*）
+│   ├── config/              # privilege + resource
+│   └── ui/                  # 桌面入口（config + 图标）
+├── scripts/build_fpk.py     # 打包脚本
+├── tests/                   # 单元测试
+│   ├── test_web.py          # web.py 测试（47 个）
+│   ├── test_build_fpk.py    # build_fpk.py 测试（10 个）
+│   └── test_shell_functions.sh  # Shell 函数测试
+├── .github/workflows/       # CI（lint + test + build）
+└── .flake8                  # Python 代码风格配置
+```
+
+### 运行测试
+
+```bash
+# 安装测试依赖
+pip install -r tests/requirements-test.txt
+
+# Python 单元测试（57 个）
+python -m pytest tests/ -v
+
+# Shell 单元测试
+bash tests/test_shell_functions.sh
+
+# Python 代码风格检查
+flake8 pkg/files/web.py scripts/build_fpk.py tests/ \
+  --max-line-length=120 --extend-ignore=E501,W503,E402,W605
+
+# Shell 语法检查
+bash -n pkg/files/fn-docker-desk.sh
+```
+
+### CI 流水线
+
+GitHub Actions（`.github/workflows/validate.yml`）在 push/PR 时自动运行：
+
+| 阶段 | 内容 |
+|------|------|
+| `lint` | flake8（Python linting）+ ShellCheck（shell linting）+ 语法检查 |
+| `test` | pytest（Python 单元测试）+ shell 单元测试 |
+| `build` | 打包 fpk + 校验包内容 + 上传 artifact |
+
+`lint` 和 `test` 并行执行，`build` 依赖两者通过。
+
 ## 版本历史
 
 | 版本 | 内容 |
 |------|------|
-| 1.0.6 | 修复应用自身图标不生成：按官方 fnpack 标准打包，ui/config 随 app.tgz 安装，应用中心正式注册桌面入口；修复脚本 CRLF 换行符问题 |
+| 1.0.6 | 修复应用自身图标不生成：按官方 fnpack 标准打包，ui/config 随 app.tgz 安装，应用中心正式注册桌面入口；修复脚本 CRLF 换行符问题；代码质量改进（配置优化/降权运行/JS独立化/死代码清理）；新增 57 个单元测试 + CI 三阶段流水线（lint/test/build） |
 | 1.0.5 | 一键还原不再删除本应用自身图标，仅清理用户图标；管理面板不再显示/管理应用自身图标 |
 | 1.0.4 | 修复管理面板一键还原误杀自身进程；还原彻底清理配置并锁定还原态 |
 | 1.0.3 | 还原彻底清理应用内图标设置（配置/持久卷/备份） |

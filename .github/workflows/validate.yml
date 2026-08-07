@@ -7,9 +7,9 @@ on:
   pull_request:
 
 jobs:
-  package:
+  # ==================== 代码检查 ====================
+  lint:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,12 +19,99 @@ jobs:
         with:
           python-version: "3.x"
 
+      - name: Install flake8
+        run: pip install flake8
+
+      - name: Run flake8 (Python linting)
+        run: |
+          flake8 pkg/files/web.py scripts/build_fpk.py tests/ \
+            --max-line-length=120 \
+            --extend-ignore=E501,W503,E402,W605 \
+            --count --statistics
+
+      - name: Run ShellCheck (shell linting)
+        uses: ludeeus/action-shellcheck@master
+        with:
+          severity: warning
+          format: gcc
+          additional_files: |
+            pkg/files/fn-docker-desk.sh
+            fn-docker-desk.sh
+            pkg/fnos/cmd/main
+            pkg/fnos/cmd/install_callback
+            pkg/fnos/cmd/upgrade_callback
+            pkg/fnos/cmd/uninstall_callback
+            pkg/fnos/cmd/install_init
+            pkg/fnos/cmd/upgrade_init
+            pkg/fnos/cmd/uninstall_init
+            pkg/fnos/cmd/config_init
+            pkg/fnos/cmd/config_callback
+
       - name: Check Python syntax
         run: python -m py_compile pkg/files/web.py scripts/build_fpk.py
 
       - name: Check shell syntax
-        run: bash -n pkg/files/fn-docker-desk.sh fn-docker-desk.sh
+        run: |
+          bash -n pkg/files/fn-docker-desk.sh
+          bash -n fn-docker-desk.sh
+          bash -n pkg/fnos/cmd/main
+          bash -n pkg/fnos/cmd/install_callback
+          bash -n pkg/fnos/cmd/upgrade_callback
+          bash -n pkg/fnos/cmd/uninstall_callback
 
-      - name: Build fpk
-        if: ${{ hashFiles('pkg/fnos/ICON.PNG', 'pkg/fnos/ICON_256.PNG', 'pkg/fnos/ui/images/icon_64.png', 'pkg/fnos/ui/images/icon_256.png') != '' }}
+  # ==================== 单元测试 ====================
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install test dependencies
+        run: pip install -r tests/requirements-test.txt
+
+      - name: Run pytest (Python unit tests)
+        run: python -m pytest tests/ -v --tb=short
+
+      - name: Run shell unit tests
+        run: bash tests/test_shell_functions.sh
+
+  # ==================== 打包构建 ====================
+  build:
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Build fpk package
         run: python scripts/build_fpk.py
+
+      - name: Verify fpk contents
+        run: |
+          FPK=$(ls dist/fn-docker-desk_*.fpk | head -1)
+          echo "Package: $FPK"
+          tar tzf "$FPK" | head -20
+          # 校验关键文件存在
+          tar tzf "$FPK" | grep -q "^manifest$"
+          tar tzf "$FPK" | grep -q "^app.tgz$"
+          tar tzf "$FPK" | grep -q "^ICON.PNG$"
+          tar tzf "$FPK" | grep -q "^cmd/main$"
+          tar tzf "$FPK" | grep -q "^config/privilege$"
+          echo "FPK package verification passed"
+
+      - name: Upload fpk artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fn-docker-desk-fpk
+          path: dist/*.fpk
+          retention-days: 30
