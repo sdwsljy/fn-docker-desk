@@ -26,7 +26,7 @@
 set -euo pipefail
 
 # ---------------- 路径与常量 ----------------
-readonly APP_VERSION="1.0.7"                     # 应用版本（与 manifest 保持一致）
+readonly APP_VERSION="1.0.8"                     # 应用版本（与 manifest 保持一致）
 readonly FN_WWW="/usr/trim/www"                 # 飞牛 Web 根目录
 readonly INDEX_HTML="${FN_WWW}/index.html"
 readonly CONF_DIR="/usr/fn-docker-desk"          # 工具配置目录（root 专属，不受 www 重建影响）
@@ -44,7 +44,7 @@ readonly MARKER_END="<!-- fn-docker-desk:end -->"
 readonly SERVICE_NAME="fn-docker-desk.service"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 readonly RESTORE_SCRIPT="/usr/local/bin/fn-docker-desk-restore.sh"
-readonly APP_USER="${TRIM_USERNAME:-fn-docker-desk}"  # 专用包用户（web.py 降权运行）
+readonly APP_USER="${TRIM_USERNAME:-fn-docker-desk}"  # 专用包用户（privilege 配置中定义）
 
 # 内置常见应用的图标 URL 映射（键为镜像名关键字，值为图标 URL）
 declare -A ICON_MAP=(
@@ -110,10 +110,6 @@ init_dirs() {
     mkdir -p "${CONF_DIR}" "${IMAGE_DIR}" "${BACKUP_DIR}"
     chmod -R 755 "${CONF_DIR}"
     [ -f "${CONF_JSON}" ] || echo '[]' > "${CONF_JSON}"
-    # 以 root 运行时，将配置目录归属包用户（web.py 降权后需读写）
-    if [ "$(id -u)" -eq 0 ] && id "${APP_USER}" >/dev/null 2>&1; then
-        chown -R "${APP_USER}:${APP_USER}" "${CONF_DIR}" 2>/dev/null || true
-    fi
 }
 
 # 获取 NAS 局域网 IP
@@ -451,16 +447,11 @@ set -euo pipefail
 if [ -f "${CONF_DIR}/fn-docker-desk.sh" ]; then
     bash "${CONF_DIR}/fn-docker-desk.sh" apply --quiet || true
 fi
-# 确保 Web 管理服务运行（降权运行，回退 root）
+# 确保 Web 管理服务运行（以 root 运行，需调用主脚本 + 访问 docker）
 if [ -f "${CONF_DIR}/web.py" ] && ! pgrep -f "web.py --port ${SVC_PORT:-5558}" >/dev/null 2>&1; then
     touch /var/log/fn-docker-desk-web.log 2>/dev/null || true
     chmod 644 /var/log/fn-docker-desk-web.log 2>/dev/null || true
-    if id "${APP_USER}" >/dev/null 2>&1; then
-        chown -R "${APP_USER}:${APP_USER}" "${CONF_DIR}" 2>/dev/null || true
-        setsid runuser -u "${APP_USER}" -- python3 -u "${CONF_DIR}/web.py" --port ${SVC_PORT:-5558} >>/var/log/fn-docker-desk-web.log 2>&1 < /dev/null &
-    else
-        setsid nohup python3 -u "${CONF_DIR}/web.py" --port ${SVC_PORT:-5558} >>/var/log/fn-docker-desk-web.log 2>&1 < /dev/null &
-    fi
+    setsid nohup python3 -u "${CONF_DIR}/web.py" --port ${SVC_PORT:-5558} >>/var/log/fn-docker-desk-web.log 2>&1 < /dev/null &
 fi
 EOF
     chmod +x "${RESTORE_SCRIPT}"

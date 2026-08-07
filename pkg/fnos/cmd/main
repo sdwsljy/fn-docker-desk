@@ -3,15 +3,14 @@
 # fn-docker-desk - 应用生命周期管理（start/stop/status）
 # ------------------------------------------------------------
 # install_type=root：生命周期脚本以 root 运行（需修改系统 Web 文件
-# /usr/trim/www、安装 systemd 服务）。Web 管理服务（web.py）尽量
-# 以专用包用户运行（runuser 降权），无法降权时回退 root。
+# /usr/trim/www、安装 systemd 服务）。Web 管理服务（web.py）也以
+# root 运行（需调用主脚本修改系统文件 + 直接访问 docker 命令）。
 # ============================================================
 set -euo pipefail
 
 DEST_DIR="/usr/fn-docker-desk"
 SVC_PORT="${TRIM_SERVICE_PORT:-5558}"
 WEB_LOG="/var/log/fn-docker-desk-web.log"
-APP_USER="${TRIM_USERNAME:-fn-docker-desk}"
 
 # ---------------- 公共函数 ----------------
 
@@ -26,7 +25,7 @@ sync_app_files() {
     fi
 }
 
-# 启动 Web 管理服务（优先 runuser 降权，回退 root）
+# 启动 Web 管理服务（以 root 运行）
 start_web_service() {
     # 已运行则跳过
     if pgrep -f "web.py --port ${SVC_PORT}" >/dev/null 2>&1; then
@@ -34,21 +33,13 @@ start_web_service() {
     fi
     [ -f "$DEST_DIR/web.py" ] || return 0
 
-    # 确保 web 日志可写（降权用户也需要）
+    # 确保 web 日志可写
     touch "$WEB_LOG" 2>/dev/null || true
     chmod 644 "$WEB_LOG" 2>/dev/null || true
 
-    # 尝试以专用包用户运行（官方推荐：长期服务降权）
-    if id "$APP_USER" >/dev/null 2>&1; then
-        # 确保配置目录归属包用户（web.py 需读写 icons.json/icons/）
-        chown -R "$APP_USER:$APP_USER" "$DEST_DIR" 2>/dev/null || true
-        runuser -u "$APP_USER" -- python3 -u "$DEST_DIR/web.py" --port "$SVC_PORT" \
-            >>"$WEB_LOG" 2>&1 &
-    else
-        # 回退：包用户不存在时以 root 运行
-        nohup python3 -u "$DEST_DIR/web.py" --port "$SVC_PORT" \
-            >>"$WEB_LOG" 2>&1 &
-    fi
+    # 以 root 运行（web.py 需调用主脚本 require_root + 直接访问 docker）
+    nohup python3 -u "$DEST_DIR/web.py" --port "$SVC_PORT" \
+        >>"$WEB_LOG" 2>&1 &
     sleep 1
 }
 
@@ -62,7 +53,7 @@ start)
     if [ -f "$DEST_DIR/fn-docker-desk.sh" ]; then
         bash "$DEST_DIR/fn-docker-desk.sh" apply --quiet || true
     fi
-    # 3. 启动 Web 管理服务（降权运行）
+    # 3. 启动 Web 管理服务
     start_web_service
     exit 0
     ;;

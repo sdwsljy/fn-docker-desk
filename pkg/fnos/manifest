@@ -1,5 +1,5 @@
 appname         = fn-docker-desk
-version         = 1.0.7
+version         = 1.0.8
 display_name    = 飞牛桌面图标
 platform        = all
 maintainer      = 胖啥胖
@@ -15,6 +15,6 @@ install_type    = root
 disable_authorization_path = true
 os_min_version  = 0.9.0
 desc            = 把 Docker 容器应用一键添加到飞牛桌面。可视化添加/移除桌面图标，支持自定义图标与端口，自动提取容器 favicon。
-changelog       = v1.0.7：代码质量改进（配置优化/降权运行/JS独立化/死代码清理），新增57个单元测试+CI三阶段流水线。v1.0.6：按飞牛官方 fnpack 标准打包，ui/config 随 app.tgz 安装，应用中心正式注册桌面入口；修复脚本 CRLF 换行符问题。v1.0.5：一键还原保留本应用图标，仅清理用户图标。v1.0.4：修复还原误杀自身进程。v1.0.1：修复图标点击被浏览器拦截。
+changelog       = v1.0.8：修复1.0.7降权运行导致的Docker容器无法读取和桌面图标无法创建问题，Web管理服务恢复以root运行。v1.0.7：代码质量改进（配置优化/JS独立化/死代码清理），新增57个单元测试+CI三阶段流水线。v1.0.6：按飞牛官方 fnpack 标准打包，ui/config 随 app.tgz 安装，应用中心正式注册桌面入口；修复脚本 CRLF 换行符问题。v1.0.5：一键还原保留本应用图标，仅清理用户图标。v1.0.4：修复还原误杀自身进程。v1.0.1：修复图标点击被浏览器拦截。
 source          = thirdparty
 checksum        =
