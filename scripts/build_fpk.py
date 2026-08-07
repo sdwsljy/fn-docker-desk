@@ -61,6 +61,7 @@ def build_app_tgz(output: Path) -> None:
     with tarfile.open(output, "w:gz") as tar:
         add_file(tar, FILES / "fn-docker-desk.sh", "fn-docker-desk.sh")
         add_file(tar, FILES / "web.py", "web.py")
+        add_file(tar, FILES / "desktop-inject.js", "desktop-inject.js")
         add_tree(tar, FNOS / "ui", "ui")
 
 

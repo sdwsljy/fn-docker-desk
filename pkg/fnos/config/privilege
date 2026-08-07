@@ -2,5 +2,8 @@
     "defaults":
     {
         "run-as": "root"
-    }
+    },
+    "username": "fn-docker-desk",
+    "groupname": "fn-docker-desk",
+    "join-groups": ["docker"]
 }

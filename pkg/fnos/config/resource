@@ -1,2 +1,7 @@
 {
+    "usr-local-linker": {
+        "bin": [
+            "fn-docker-desk.sh"
+        ]
+    }
 }

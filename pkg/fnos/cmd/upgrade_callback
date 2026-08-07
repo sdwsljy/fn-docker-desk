@@ -1,26 +1,50 @@
 #!/bin/bash
-# 飞牛桌面图标 - 升级后处理
-# 升级后复制工具文件、自动恢复用户配置（从 @appdata 持久卷）、重新注入并确保 Web 服务
+# ============================================================
+# fn-docker-desk - 升级后处理
+# ------------------------------------------------------------
+# 升级后复制最新工具文件、从 @appdata 持久卷恢复用户配置、
+# 重新注入桌面并确保 Web 服务运行。与 main 保持一致的降权策略。
+# ============================================================
+set -euo pipefail
+
 DEST_DIR="/usr/fn-docker-desk"
 SVC_PORT="${TRIM_SERVICE_PORT:-5558}"
-if [ -d "$TRIM_APPDEST" ]; then
-    mkdir -p "$DEST_DIR"
+WEB_LOG="/var/log/fn-docker-desk-web.log"
+APP_USER="${TRIM_USERNAME:-fn-docker-desk}"
+
+# 1. 同步最新工具文件
+mkdir -p "$DEST_DIR"
+if [ -d "${TRIM_APPDEST:-}" ]; then
     cp -f "$TRIM_APPDEST"/fn-docker-desk.sh "$DEST_DIR/" 2>/dev/null || true
     cp -f "$TRIM_APPDEST"/web.py "$DEST_DIR/" 2>/dev/null || true
+    cp -f "$TRIM_APPDEST"/desktop-inject.js "$DEST_DIR/" 2>/dev/null || true
     chmod +x "$DEST_DIR/fn-docker-desk.sh" 2>/dev/null || true
 fi
+
+# 2. 应用桌面注入（apply 内部会先从 @appdata 持久卷恢复用户配置）
 if [ -f "$DEST_DIR/fn-docker-desk.sh" ]; then
-    # apply 内部会先从 @appdata 持久卷恢复用户配置，再发布+注入
     bash "$DEST_DIR/fn-docker-desk.sh" apply --quiet 2>/dev/null || true
 fi
-# 启动 Web 管理服务（优先 systemd 托管，失败再 nohup）
-if ! systemctl is-active fn-docker-desk-web.service >/dev/null 2>&1; then
+
+# 3. 启动 Web 管理服务（优先 systemd 托管，再降权 nohup）
+if ! pgrep -f "web.py --port ${SVC_PORT}" >/dev/null 2>&1; then
+    # 尝试 systemd 托管服务
     if systemctl list-unit-files fn-docker-desk-web.service >/dev/null 2>&1; then
         systemctl start fn-docker-desk-web.service 2>/dev/null || true
     fi
+    # systemd 未拉起时，降权 nohup 启动
+    if ! pgrep -f "web.py --port ${SVC_PORT}" >/dev/null 2>&1 && [ -f "$DEST_DIR/web.py" ]; then
+        touch "$WEB_LOG" 2>/dev/null || true
+        chmod 644 "$WEB_LOG" 2>/dev/null || true
+        if id "$APP_USER" >/dev/null 2>&1; then
+            chown -R "$APP_USER:$APP_USER" "$DEST_DIR" 2>/dev/null || true
+            runuser -u "$APP_USER" -- python3 -u "$DEST_DIR/web.py" --port "$SVC_PORT" \
+                >>"$WEB_LOG" 2>&1 &
+        else
+            nohup python3 -u "$DEST_DIR/web.py" --port "$SVC_PORT" \
+                >>"$WEB_LOG" 2>&1 &
+        fi
+    fi
 fi
-if [ -f "$DEST_DIR/web.py" ] && ! pgrep -f "web.py --port ${SVC_PORT}" >/dev/null 2>&1; then
-    nohup python3 -u "$DEST_DIR/web.py" --port "$SVC_PORT" \
-        >/var/log/fn-docker-desk-web.log 2>&1 &
-fi
+
 exit 0
