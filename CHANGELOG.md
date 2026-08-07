@@ -1,10 +1,7 @@
 # Changelog
 
-## 1.0.6
+## 1.0.7
 
-- 修复应用自身图标不生成：按飞牛官方 fnpack 标准打包，`ui/config` 随 `app.tgz` 安装。
-- 应用中心正式注册桌面入口，安装完成后生成「飞牛桌面图标」。
-- 修复脚本 CRLF 换行符问题。
 - 代码质量改进：
   - 按官方文档优化 `manifest`/`privilege`/`resource` 配置（`ctl_stop`、`disable_authorization_path`、专用用户/组、`docker` join-group、`usr-local-linker`）。
   - Web 管理服务降权运行（`runuser` 专用包用户，回退 root）。
@@ -15,6 +12,12 @@
   - 新增 57 个 Python 单元测试（`pytest`），覆盖核心函数、HTTP 路由、安全校验、打包一致性。
   - 新增 Shell 单元测试脚本，覆盖 6 个纯函数（端口解析、图标匹配、路径安全等）。
   - CI 拆分为 `lint` / `test` / `build` 三阶段，集成 ShellCheck、flake8、pytest、fpk 打包验证和 artifact 上传。
+
+## 1.0.6
+
+- 修复应用自身图标不生成：按飞牛官方 fnpack 标准打包，`ui/config` 随 `app.tgz` 安装。
+- 应用中心正式注册桌面入口，安装完成后生成「飞牛桌面图标」。
+- 修复脚本 CRLF 换行符问题。
 
 ## 1.0.5
 
