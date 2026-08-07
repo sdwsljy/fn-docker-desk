@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0
+
+- 修复添加图标时飞牛OS断开连接的问题：`apply_inject` 中 `systemctl restart trim_nginx.service` 会强制重启 nginx 导致所有 WebSocket 连接和 HTTP 会话断开
+- 改用 `systemctl reload trim_nginx.service` 优雅重载，不中断现有连接
+- 所有 `restart trim_nginx` 调用统一改为 `reload`（apply_inject / restore / uninstall）
+
 ## 1.0.9
 - 修复管理面板 JavaScript 语法错误：`onerror` 属性中的单引号转义在 Python 原始字符串中丢失反斜杠，导致 `SyntaxError: Unexpected identifier 'none'`，管理面板无法加载容器和图标数据
 - 改用 HTML 实体 `&#39;` 替代 JavaScript 转义 `\'`，彻底解决跨语言字符串转义问题

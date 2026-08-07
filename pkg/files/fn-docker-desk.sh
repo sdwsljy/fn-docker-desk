@@ -26,7 +26,7 @@
 set -euo pipefail
 
 # ---------------- 路径与常量 ----------------
-readonly APP_VERSION="1.0.9"                     # 应用版本（与 manifest 保持一致）
+readonly APP_VERSION="1.1.0"                     # 应用版本（与 manifest 保持一致）
 readonly FN_WWW="/usr/trim/www"                 # 飞牛 Web 根目录
 readonly INDEX_HTML="${FN_WWW}/index.html"
 readonly CONF_DIR="/usr/fn-docker-desk"          # 工具配置目录（root 专属，不受 www 重建影响）
@@ -408,8 +408,8 @@ PYEOF
         return 1
     fi
 
-    systemctl restart trim_nginx.service >/dev/null 2>&1 || true
-    log_info "已 patch fnOS Web 源包并重启 trim_nginx"
+    systemctl reload trim_nginx.service 2>/dev/null || true
+    log_info "已 patch fnOS Web 源包并 reload trim_nginx（不断开现有连接）"
 }
 
 # 生成桌面可读的 JSON（主数据在 /usr/fn-docker-desk，兼容旧 userimg 路径）
@@ -930,17 +930,17 @@ PYEOF
     local restored=0
     if [ -f "${restore_zip}" ] && precise_restore_web_zip "${restore_zip}"; then
         restored=1
-        systemctl restart trim_nginx.service >/dev/null 2>&1 || true
+        systemctl reload trim_nginx.service 2>/dev/null || true
         log_info "已精准移除 fnOS Web 源包中的 fn-docker-desk 注入"
     else
         log_warn "精准反注入失败，从备份恢复本工具改动的文件（不整体覆盖，保护应用商城已装应用）"
         if [ -f "${restore_zip}.fndesk.orig" ] && restore_our_files_from_zip "${restore_zip}" "${restore_zip}.fndesk.orig"; then
             restored=1
-            systemctl restart trim_nginx.service >/dev/null 2>&1 || true
+            systemctl reload trim_nginx.service 2>/dev/null || true
             log_info "已从本工具原始备份恢复改动文件: index.html + 主 JS"
         elif [ -f "/usr/trim/share/.restore/www.bak" ] && restore_our_files_from_zip "${restore_zip}" "/usr/trim/share/.restore/www.bak"; then
             restored=1
-            systemctl restart trim_nginx.service >/dev/null 2>&1 || true
+            systemctl reload trim_nginx.service 2>/dev/null || true
             log_warn "未找到本工具原始备份，已从外部 Fndesk www.bak 恢复改动文件"
         else
             log_warn "未找到可用的还原备份，仅清理本工具配置"
@@ -1050,7 +1050,7 @@ cmd_uninstall() {
     # 2. 移除注入（运行目录 + 源包）
     precise_restore_runtime_web >/dev/null 2>&1 || true
     precise_restore_web_zip "/usr/trim/share/.restore/www.zip" >/dev/null 2>&1 || true
-    systemctl restart trim_nginx.service >/dev/null 2>&1 || true
+    systemctl reload trim_nginx.service 2>/dev/null || true
     # 3. 移除自启注入服务
     uninstall_persistence
     # 4. 停止并清理 web 托管服务（fn-docker-desk-web.service）
