@@ -1,0 +1,25 @@
+[flake8]
+# 行宽与项目风格一致
+max-line-length = 120
+
+# 排除不需要检查的目录
+exclude =
+    .git,
+    __pycache__,
+    dist,
+    build,
+    .venv,
+    venv
+
+# 忽略的规则
+# E501: 行过长（已在 max-line-length 控制）
+# W503: 二元运算符前换行（与 PEP8 推荐一致）
+# E402: 模块级 import 不在文件顶部（web.py 中 import 在常量之后）
+# W605: 无效转义序列（web.py 中 JS 正则的 \/ \d 在 raw string 中是合法的）
+extend-ignore = E501, W503, E402, W605
+
+# 需检查的文件
+filename =
+    *.py,
+    pkg/files/web.py,
+    scripts/build_fpk.py
