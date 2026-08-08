@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-飞牛桌面图标 v1.1.0 - Web 管理界面
+飞牛桌面图标 v1.1.1 - Web 管理界面
 ================================
 把 Docker 容器应用一键添加到飞牛桌面的管理面板。
 
@@ -45,7 +45,7 @@ BACKUP_DIR = "/usr/fn-docker-desk/backup"
 ICON_DIR = "/usr/fn-docker-desk/icons"
 LOG_FILE = "/var/log/fn-docker-desk.log"
 DEFAULT_PORT = 5558
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -303,7 +303,7 @@ body::before {
   <div class="term">
     <div class="term-bar">
       <div class="dots"><i></i><i></i><i></i></div>
-      <div class="term-title"><b>fn-docker-desk</b> · 桌面图标管理 <span class="ver">v1.1.0</span></div>
+      <div class="term-title"><b>fn-docker-desk</b> · 桌面图标管理 <span class="ver">v1.1.1</span></div>
       <div class="term-addr">NAS&nbsp;<b id="externalUrl">检测中…</b></div>
     </div>
     <div class="term-body">
@@ -720,7 +720,7 @@ window.onload = go;
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "fn-docker-desk/1.1.0"
+    server_version = "fn-docker-desk/1.1.1"
 
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
         if isinstance(body, str):

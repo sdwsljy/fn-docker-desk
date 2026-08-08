@@ -2,7 +2,7 @@
 
 把 Docker 容器应用一键添加到飞牛 OS（fnOS）桌面。通过飞牛应用中心安装 `.fpk` 应用包后，桌面出现「飞牛桌面图标」入口，可视化地把任意 Docker 容器"钉"到桌面，点击直达服务页面。
 
-- 当前版本：**v1.1.0**
+- 当前版本：**v1.1.1**
 - 支持平台：fnOS（x86 / ARM）
 - 开发维护：胖啥胖
 
@@ -30,7 +30,7 @@
 
 ### 应用中心手动安装（推荐）
 
-1. 下载 `fn-docker-desk_1.1.0_all.fpk`
+1. 下载 `fn-docker-desk_1.1.1_all.fpk`
 2. 登录飞牛 NAS 桌面 → 打开「应用中心」→ 左下角「手动安装」
 3. 选择 fpk 文件上传，确认安装
 4. 安装完成后桌面出现「飞牛桌面图标」，点击打开管理面板
@@ -41,7 +41,7 @@
 ### 命令行安装（可选）
 
 ```bash
-sudo appcenter-cli install-fpk /path/to/fn-docker-desk_1.1.0_all.fpk --volume 1
+sudo appcenter-cli install-fpk /path/to/fn-docker-desk_1.1.1_all.fpk --volume 1
 sudo appcenter-cli start fn-docker-desk
 ```
 
@@ -104,7 +104,7 @@ fn-docker-desk restore
 飞牛桌面是 Web 应用（React + Tailwind），官方应用中心安装的应用注册到 PostgreSQL `appcenter` 库才会出现在桌面，Docker 自建应用官方不支持直接上桌面。本应用通过前端注入实现：
 
 1. 应用安装时按 fnOS 官方规范（fnpack）打包，`ui/config` 随 `app.tgz` 安装到 target，应用中心据此在 `app_service` 表注册桌面入口，生成「飞牛桌面图标」应用图标
-2. 工具启动时向 `/usr/trim/www/index.html` 注入 JS 脚本（幂等，带版本标记 `?v=fndesk14`），同时 patch `/usr/trim/share/.restore/www.zip` 源包，避免系统刷新后丢失
+2. 工具启动时向 `/usr/trim/www/index.html` 注入 JS 脚本（幂等，带版本标记 `?v=fndesk15`），同时 patch `/usr/trim/share/.restore/www.zip` 源包，避免系统刷新后丢失
 3. 注入的 JS 在桌面渲染后读取图标配置，动态创建与原生图标同结构的 `<a>` 元素；配置优先从同源 `/userimg/fn-docker-desk.json` 读取，失败时回退到面板 `/api/icons`
 4. systemd 服务（`fn-docker-desk.service`）开机重放注入，保证持久化；数据同步备份到持久卷 `/usr/local/apps/@appdata/fn-docker-desk`，升级/重装后自动恢复
 
@@ -147,7 +147,7 @@ fn-docker-desk restore
 遵循飞牛官方 fnpack 规范（[官方文档](https://developer.fnnas.com/docs/core-concepts/manifest/)）：
 
 ```
-fn-docker-desk_1.1.0_all.fpk (tar.gz)
+fn-docker-desk_1.1.1_all.fpk (tar.gz)
 ├── manifest              # 应用清单（appname/version/service_port/desktop_uidir...）
 ├── ICON.PNG / ICON_256.PNG
 ├── app.tgz               # 应用文件，解压到 target（含 ui/config 桌面入口注册）
@@ -168,7 +168,7 @@ fn-docker-desk_1.1.0_all.fpk (tar.gz)
 python scripts/build_fpk.py
 ```
 
-脚本只依赖 Python 标准库，输出文件位于 `dist/fn-docker-desk_1.1.0_all.fpk`。
+脚本只依赖 Python 标准库，输出文件位于 `dist/fn-docker-desk_1.1.1_all.fpk`。
 
 ## 开发与测试
 
@@ -230,6 +230,7 @@ GitHub Actions（`.github/workflows/validate.yml`）在 push/PR 时自动运行�
 
 | 版本 | 内容 |
 |------|------|
+| 1.1.1 | 修复桌面图标反复闪烁：排序前置+差异渲染+DOM存活检查，简化轮询，防抖提升 |
 | 1.1.0 | 修复添加图标时 nginx 重启导致飞牛 OS 断开连接，改用 reload 优雅重载 |
 | 1.0.9 | 修复管理面板 JavaScript 语法错误（onerror 属性单引号转义丢失导致面板无法加载数据），改用 HTML 实体替代 JS 转义 |
 | 1.0.8 | 修复 1.0.7 降权运行导致 Docker 容器无法读取和桌面图标无法创建的问题；Web 管理服务恢复以 root 运行 |

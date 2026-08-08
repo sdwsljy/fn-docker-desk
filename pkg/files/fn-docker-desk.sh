@@ -26,7 +26,7 @@
 set -euo pipefail
 
 # ---------------- 路径与常量 ----------------
-readonly APP_VERSION="1.1.0"                     # 应用版本（与 manifest 保持一致）
+readonly APP_VERSION="1.1.1"                     # 应用版本（与 manifest 保持一致）
 readonly FN_WWW="/usr/trim/www"                 # 飞牛 Web 根目录
 readonly INDEX_HTML="${FN_WWW}/index.html"
 readonly CONF_DIR="/usr/fn-docker-desk"          # 工具配置目录（root 专属，不受 www 重建影响）
@@ -365,7 +365,7 @@ inject_file = pathlib.Path(sys.argv[3])
 app_version = sys.argv[4]
 idx = index.read_text('utf-8', errors='replace')
 idx = re.sub(r'src="(/assets/index-[^"?]+\.js)(?:\?[^"]*)?"',
-             r'src="\1?v=fndesk14"', idx, count=1)
+             r'src="\1?v=fndesk15"', idx, count=1)
 index.write_text(idx, 'utf-8')
 
 js = asset.read_text('utf-8', errors='replace')

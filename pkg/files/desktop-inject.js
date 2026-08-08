@@ -69,12 +69,16 @@
     d.appendChild(cover);
     return d;
   }
-  // ---- 防闪烁机制 ----
+  // ---- 防闪烁机制（v1.1.1 重构）----
+  // 核心改进：
+  //   1. 排序前置 —— 先 sort 再算签名，消除 API 返回顺序波动导致的误判
+  //   2. 差异渲染 —— 只增删变化的图标，不触碰未变化的，避免全量闪烁
+  //   3. DOM 存活检查 —— 签名匹配时仍检查图标是否在 DOM 中，React 重渲染移除后自动恢复
   var rendering=false;       // 防止重入
   var lastSig='';            // 数据签名，跳过无变化的重渲染
   var observer=null;         // MutationObserver 实例（渲染期间暂停）
   function dataSig(data){
-    // 生成数据指纹，用于判断是否需要重渲染
+    // 生成数据指纹，用于判断是否需要重渲染（data 已排序，签名稳定）
     return data.map(function(it){return (it['序号']||0)+'|'+(it['标题']||'')+'|'+(it['跳转URL']||'')+'|'+(it['图片URL']||'');}).join(';;');
   }
   function render(){
@@ -83,36 +87,57 @@
     rendering=true;
     loadIcons().then(function(data){
       if(!Array.isArray(data)||!data.length){rendering=false;return;}
+      // ★ 修复1：先排序再算签名，保证签名稳定
+      data.sort(function(a,b){return(a['序号']||0)-(b['序号']||0);});
       var sig=dataSig(data);
-      if(sig===lastSig){rendering=false;return;}  // 数据无变化，跳过
-      var t=findTarget(); if(!t){rendering=false;console.warn('fn-docker-desk: desktop container not found'); return;}
+      var t=findTarget(); if(!t){rendering=false;return;}
+      // 收集当前 DOM 中的已有图标
+      var existing={};
+      var oldEls=t.querySelectorAll('['+MARK+']');
+      for(var i=0;i<oldEls.length;i++){
+        existing[oldEls[i].getAttribute('data-desktop-item-id')]=oldEls[i];
+      }
+      // ★ 修复3：签名匹配 AND 所有图标都在 DOM 中 → 真正无需操作
+      if(sig===lastSig && Object.keys(existing).length===data.length){
+        rendering=false;
+        return;
+      }
       // 暂停 Observer，避免自身 DOM 操作触发循环
       if(observer){try{observer.disconnect();}catch(e){}}
-      var old=t.querySelectorAll('['+MARK+']'); for(var i=0;i<old.length;i++)old[i].remove();
-      data.sort(function(a,b){return(a['序号']||0)-(b['序号']||0);});
-      // 使用 DocumentFragment 批量插入，减少重排次数
+      // ★ 修复2：差异渲染 —— 只添加缺失的、移除多余的，不触碰已有的
+      var needed={};
       var frag=document.createDocumentFragment();
-      data.forEach(function(item,idx){frag.appendChild(buildItem(item,idx));});
-      t.appendChild(frag);
+      var hasNew=false;
+      data.forEach(function(item){
+        var seq=item['序号']||0;
+        var id='fndesk-'+seq;
+        needed[id]=true;
+        if(!existing[id]){
+          frag.appendChild(buildItem(item,seq));
+          hasNew=true;
+        }
+      });
+      // 移除不再需要的图标
+      for(var id in existing){
+        if(!needed[id]){existing[id].remove();}
+      }
+      // 仅在有新图标时追加
+      if(hasNew){t.appendChild(frag);}
+      var sigChanged=sig!==lastSig;
       lastSig=sig;
       // 恢复 Observer
       if(observer){try{observer.observe(document.getElementById('root')||document.body,{childList:true,subtree:true});}catch(e){}}
-      window.__fnDeskDiag={ok:true,count:data.length,targetClass:String(t.className||''),ts:Date.now()};
+      window.__fnDeskDiag={ok:true,count:data.length,existing:Object.keys(existing).length,new:hasNew,sigChanged:sigChanged,ts:Date.now()};
     }).catch(function(e){console.error('fn-docker-desk:',e); window.__fnDeskDiag={ok:false,err:String(e),ts:Date.now()};})
       .finally(function(){rendering=false;});
   }
-  var timer=null; function schedule(){clearTimeout(timer); timer=setTimeout(render,400);}
+  var timer=null; function schedule(){clearTimeout(timer); timer=setTimeout(render,500);}
   function start(){
     try{observer=new MutationObserver(schedule); observer.observe(document.getElementById('root')||document.body,{childList:true,subtree:true});}catch(e){}
     schedule();
-    // 智能轮询：前 5 次每秒尝试（覆盖桌面异步加载），成功后降频到每 10 秒保活
-    var n=0;
-    (function wait(){
-      render();
-      n++;
-      if(n<5){setTimeout(wait,1000);}
-      else{setInterval(render,10000);}
-    })();
+    // ★ 简化轮询：去掉激进的前5次每秒轮询，改为 15 秒保活检查
+    // MutationObserver 已覆盖 DOM 变化场景，轮询仅用于 Observer 遗漏的边缘情况
+    setInterval(render,15000);
   }
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',start); else start();
 })();

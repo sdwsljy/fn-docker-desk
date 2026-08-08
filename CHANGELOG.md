@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.1
+
+- 修复桌面图标反复闪烁问题，重构 `desktop-inject.js` 渲染逻辑：
+  - **排序前置**：先 sort 再算数据签名，消除 API 返回顺序波动导致的误判
+  - **差异渲染**：只增删变化的图标，不触碰未变化的，避免全量闪烁
+  - **DOM 存活检查**：签名匹配时仍检查图标是否在 DOM 中，React 重渲染移除后自动恢复
+  - **简化轮询**：去掉激进的前 5 次每秒轮询，改为 15 秒保活检查
+  - **防抖提升**：MutationObserver 防抖从 400ms 提升到 500ms
+  - 注入版本标记升级 `fndesk14` → `fndesk15`，强制浏览器加载新 JS
+
 ## 1.1.0
 
 - 修复添加图标时飞牛OS断开连接的问题：`apply_inject` 中 `systemctl restart trim_nginx.service` 会强制重启 nginx 导致所有 WebSocket 连接和 HTTP 会话断开
