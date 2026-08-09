@@ -407,6 +407,8 @@ PYEOF
         log_info "已备份 fnOS Web 源包: ${restore_zip}.fndesk.orig"
     fi
     cp -f "${restore_zip}" "${restore_zip}.fndesk.bak.$(date +%Y%m%d%H%M%S)"
+    # 只保留最近 2 个源包备份，避免 50MB+ 级 www.zip 备份堆积占满磁盘
+    ls -1t "${restore_zip}".fndesk.bak.* 2>/dev/null | tail -n +3 | xargs -r rm -f 2>/dev/null || true
     if ! (cd "${tmproot}" && zip -q -u "${restore_zip}" index.html "${asset}") 2>/dev/null; then
         log_warn "更新 fnOS Web 源包失败（当前运行目录已生效，但系统重启后图标可能丢失）"
         return 1
@@ -766,51 +768,53 @@ precise_restore_web_zip() {
     command -v zip >/dev/null 2>&1 || return 1
 
     # 返回值：0=已更新；2=未发现注入（已干净）；非0=处理失败
+    # 注意：fnOS 新版桌面 www.zip 含加密条目，zipfile 全量重写会失败，
+    #       因此只读取/更新 index.html 与主 JS，用 zip -u 增量写回（不触碰其他条目）
     python3 - "${restore_zip}" <<'PYEOF'
 import pathlib
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import zipfile
 
 zip_path = pathlib.Path(sys.argv[1])
-tmp = pathlib.Path(tempfile.mkdtemp(prefix="fn-docker-desk-restore."))
-changed = {}
 marker = re.compile(r';/\* fn-docker-desk asset injection v[01]\.[0-9.]+ \*/')
+tmp = pathlib.Path(tempfile.mkdtemp(prefix="fn-docker-desk-restore."))
 try:
     with zipfile.ZipFile(zip_path, "r") as z:
         names = set(z.namelist())
-        # 1. 清除 index.html 中所有 fndesk 版本参数（不依赖特定 JS 文件名）
-        if "index.html" in names:
-            index = z.read("index.html").decode("utf-8", "replace")
-            new_index = re.sub(r'\?v=fndesk[0-9]+"', '"', index)
-            if new_index != index:
-                changed["index.html"] = new_index.encode("utf-8")
-        # 2. 遍历 assets 下所有 js，清除 fn-docker-desk 注入代码
-        for name in sorted(names):
-            if name.startswith("assets/") and name.endswith(".js"):
-                js = z.read(name).decode("utf-8", "replace")
+        if "index.html" not in names:
+            print("index.html not found in www.zip", file=sys.stderr)
+            sys.exit(1)
+        index = z.read("index.html").decode("utf-8", "replace")
+        new_index = re.sub(r'\?v=fndesk[0-9]+"', '"', index)
+        changed = []
+        if new_index != index:
+            (tmp / "index.html").write_text(new_index, "utf-8")
+            changed.append("index.html")
+        # 主 JS：优先 index-*.js，回退 assets 下第一个 js
+        m = re.search(r'src="(/assets/index-[^"?]+\.js)(?:\?[^"]*)?"', index)
+        if not m:
+            m = re.search(r'src="(/assets/[^"?]+\.js)(?:\?[^"]*)?"', index)
+        if m:
+            asset = m.group(1).lstrip("/")
+            if asset in names and asset.endswith(".js"):
+                js = z.read(asset).decode("utf-8", "replace")
                 parts = marker.split(js, maxsplit=1)
                 if len(parts) > 1:
-                    changed[name] = (parts[0].rstrip() + "\n").encode("utf-8")
-
+                    out = tmp / asset
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    out.write_text(parts[0].rstrip() + "\n", "utf-8")
+                    changed.append(asset)
     if not changed:
         print("no fn-docker-desk injection found")
         sys.exit(2)
-
     bak = zip_path.with_name(zip_path.name + ".fndesk.restore.bak")
     shutil.copy2(zip_path, bak)
-    # 用 Python zipfile 重写 www.zip（不依赖外部 zip 命令，兼容性更强）
-    tmp_zip = zip_path.with_name(zip_path.name + ".fndesk.tmp")
-    with zipfile.ZipFile(zip_path, "r") as zin, zipfile.ZipFile(tmp_zip, "w") as zout:
-        for item in zin.infolist():
-            if item.filename in changed:
-                zout.writestr(item, changed[item.filename])
-            else:
-                zout.writestr(item, zin.read(item.filename))
-    tmp_zip.replace(zip_path)
-    print("precise restore updated: " + ", ".join(sorted(changed.keys())))
+    subprocess.run(["zip", "-q", "-u", str(zip_path), *changed], cwd=str(tmp), check=True)
+    print("precise restore updated: " + ", ".join(changed))
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 PYEOF
@@ -865,11 +869,12 @@ restore_our_files_from_zip() {
 import pathlib
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import zipfile
 
 dst, src = sys.argv[1], sys.argv[2]
-updates = {}
 with zipfile.ZipFile(src) as z:
     names = set(z.namelist())
     if "index.html" not in names:
@@ -883,20 +888,18 @@ with zipfile.ZipFile(src) as z:
         print("backup zip main asset not found", file=sys.stderr)
         sys.exit(1)
     asset = m.group(1).lstrip("/")
-    updates["index.html"] = z.read("index.html")
-    updates[asset] = z.read(asset)
-# 用 Python zipfile 重写目标 zip（只替换本工具改动的文件，保留其余条目）
-bak = pathlib.Path(dst).with_name(pathlib.Path(dst).name + ".fndesk.restore.bak")
-shutil.copy2(dst, bak)
-tmp_zip = pathlib.Path(dst).with_name(pathlib.Path(dst).name + ".fndesk.tmp")
-with zipfile.ZipFile(dst, "r") as zin, zipfile.ZipFile(tmp_zip, "w") as zout:
-    for item in zin.infolist():
-        if item.filename in updates:
-            zout.writestr(item, updates[item.filename])
-        else:
-            zout.writestr(item, zin.read(item.filename))
-tmp_zip.replace(dst)
-print("restored our files: index.html + " + asset)
+tmp = tempfile.mkdtemp(prefix="fn-docker-desk-restore.")
+try:
+    with zipfile.ZipFile(src) as z:
+        for name in ("index.html", asset):
+            p = pathlib.Path(tmp) / name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(z.read(name))
+    # 用 zip 命令增量更新（目标 zip 可能含加密条目，zipfile 全量重写会失败）
+    subprocess.run(["zip", "-q", "-u", dst, "index.html", asset], cwd=tmp, check=True)
+    print("restored our files: index.html + " + asset)
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
 PYEOF
 }
 
@@ -949,7 +952,11 @@ PYEOF
     fi
     if [ "${restored}" -eq 1 ]; then
         systemctl reload trim_nginx.service 2>/dev/null || true
-        log_info "已精准移除 fnOS Web 源包与运行目录中的 fn-docker-desk 注入"
+        if [ "${zip_rc}" -eq 0 ] || [ "${zip_rc}" -eq 2 ]; then
+            log_info "已精准移除 fnOS Web 源包与运行目录中的 fn-docker-desk 注入"
+        else
+            log_warn "运行目录注入已移除，但 fnOS Web 源包（www.zip）更新失败，系统重建桌面后注入可能复活，建议重启应用或手动检查 www.zip"
+        fi
     else
         log_warn "精准反注入未完全生效，从备份恢复本工具改动的文件（不整体覆盖，保护应用商城已装应用）"
         if [ -f "${restore_zip}" ] && [ -f "${restore_zip}.fndesk.orig" ] && restore_our_files_from_zip "${restore_zip}" "${restore_zip}.fndesk.orig"; then
