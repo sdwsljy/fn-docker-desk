@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.2
+
+- 修复 `download_icon()` 日志污染图标路径的 bug：
+  - **根因**：`download_icon()` 中 `log_info`/`log_warn` 输出到 stdout，与 `echo "${rel_path}"` 混在同一个命令替换 `$(...)` 中，导致 `图片URL` 字段被 `[INFO] 图标下载成功: ...` 前缀污染，桌面注入 JS 无法识别路径，图标回退显示首字母
+  - **修复**：日志输出重定向到 stderr（`>&2`），stdout 仅保留路径返回值；失败路径的 `log_warn` 同样重定向，避免 `image_rel` 被污染导致后续回退逻辑被跳过
+  - 排查确认其他被命令替换捕获的函数（`grab_container_favicon`/`gen_fallback_icon`/`resolve_container`/`next_seq`/`match_builtin_icon`）无同类问题
+
 ## 1.1.1
 
 - 修复桌面图标反复闪烁问题，重构 `desktop-inject.js` 渲染逻辑：

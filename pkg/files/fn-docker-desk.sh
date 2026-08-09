@@ -26,7 +26,7 @@
 set -euo pipefail
 
 # ---------------- 路径与常量 ----------------
-readonly APP_VERSION="1.1.1"                     # 应用版本（与 manifest 保持一致）
+readonly APP_VERSION="1.1.2"                     # 应用版本（与 manifest 保持一致）
 readonly FN_WWW="/usr/trim/www"                 # 飞牛 Web 根目录
 readonly INDEX_HTML="${FN_WWW}/index.html"
 readonly CONF_DIR="/usr/fn-docker-desk"          # 工具配置目录（root 专属，不受 www 重建影响）
@@ -185,13 +185,14 @@ download_icon() {
     for u in "${urls[@]}"; do
         if curl -fsSL --connect-timeout 4 -m 8 -o "${local_path}" "${u}" 2>/dev/null \
            && [ -s "${local_path}" ]; then
-            log_info "图标下载成功: ${u}"
+            # 日志走 stderr，避免污染 stdout 返回的 rel_path（调用方用 $(...) 捕获）
+            log_info "图标下载成功: ${u}" >&2
             echo "${rel_path}"
             return 0
         fi
         now=$(date +%s)
         if [ $((now - total_start)) -ge 25 ]; then
-            log_warn "图标下载超过 25s，放弃并降级占位图标: ${url}"
+            log_warn "图标下载超过 25s，放弃并降级占位图标: ${url}" >&2
             break
         fi
     done
