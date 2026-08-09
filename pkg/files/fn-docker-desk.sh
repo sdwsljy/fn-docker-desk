@@ -26,7 +26,7 @@
 set -euo pipefail
 
 # ---------------- 路径与常量 ----------------
-readonly APP_VERSION="1.1.2"                     # 应用版本（与 manifest 保持一致）
+readonly APP_VERSION="1.1.3"                     # 应用版本（与 manifest 保持一致）
 readonly FN_WWW="/usr/trim/www"                 # 飞牛 Web 根目录
 readonly INDEX_HTML="${FN_WWW}/index.html"
 readonly CONF_DIR="/usr/fn-docker-desk"          # 工具配置目录（root 专属，不受 www 重建影响）
@@ -787,7 +787,6 @@ try:
         if not m:
             print("main asset not found in index.html", file=sys.stderr)
             sys.exit(1)
-
         asset_name = m.group(1).lstrip("/")
         if asset_name not in names:
             print("main asset not found in www.zip: %s" % asset_name, file=sys.stderr)
