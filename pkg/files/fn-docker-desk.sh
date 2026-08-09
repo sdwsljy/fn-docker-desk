@@ -770,14 +770,13 @@ precise_restore_web_zip() {
 import pathlib
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 import zipfile
 
 zip_path = pathlib.Path(sys.argv[1])
 tmp = pathlib.Path(tempfile.mkdtemp(prefix="fn-docker-desk-restore."))
-changed = []
+changed = {}
 marker = re.compile(r';/\* fn-docker-desk asset injection v[01]\.[0-9.]+ \*/')
 try:
     with zipfile.ZipFile(zip_path, "r") as z:
@@ -787,18 +786,14 @@ try:
             index = z.read("index.html").decode("utf-8", "replace")
             new_index = re.sub(r'\?v=fndesk[0-9]+"', '"', index)
             if new_index != index:
-                (tmp / "index.html").write_text(new_index, "utf-8")
-                changed.append("index.html")
+                changed["index.html"] = new_index.encode("utf-8")
         # 2. 遍历 assets 下所有 js，清除 fn-docker-desk 注入代码
         for name in sorted(names):
             if name.startswith("assets/") and name.endswith(".js"):
                 js = z.read(name).decode("utf-8", "replace")
                 parts = marker.split(js, maxsplit=1)
                 if len(parts) > 1:
-                    out = tmp / name
-                    out.parent.mkdir(parents=True, exist_ok=True)
-                    out.write_text(parts[0].rstrip() + "\n", "utf-8")
-                    changed.append(name)
+                    changed[name] = (parts[0].rstrip() + "\n").encode("utf-8")
 
     if not changed:
         print("no fn-docker-desk injection found")
@@ -806,8 +801,16 @@ try:
 
     bak = zip_path.with_name(zip_path.name + ".fndesk.restore.bak")
     shutil.copy2(zip_path, bak)
-    subprocess.run(["zip", "-q", "-u", str(zip_path), *changed], cwd=str(tmp), check=True)
-    print("precise restore updated: " + ", ".join(changed))
+    # 用 Python zipfile 重写 www.zip（不依赖外部 zip 命令，兼容性更强）
+    tmp_zip = zip_path.with_name(zip_path.name + ".fndesk.tmp")
+    with zipfile.ZipFile(zip_path, "r") as zin, zipfile.ZipFile(tmp_zip, "w") as zout:
+        for item in zin.infolist():
+            if item.filename in changed:
+                zout.writestr(item, changed[item.filename])
+            else:
+                zout.writestr(item, zin.read(item.filename))
+    tmp_zip.replace(zip_path)
+    print("precise restore updated: " + ", ".join(sorted(changed.keys())))
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 PYEOF
@@ -862,12 +865,11 @@ restore_our_files_from_zip() {
 import pathlib
 import re
 import shutil
-import subprocess
 import sys
-import tempfile
 import zipfile
 
 dst, src = sys.argv[1], sys.argv[2]
+updates = {}
 with zipfile.ZipFile(src) as z:
     names = set(z.namelist())
     if "index.html" not in names:
@@ -881,17 +883,20 @@ with zipfile.ZipFile(src) as z:
         print("backup zip main asset not found", file=sys.stderr)
         sys.exit(1)
     asset = m.group(1).lstrip("/")
-tmp = tempfile.mkdtemp(prefix="fn-docker-desk-restore.")
-try:
-    with zipfile.ZipFile(src) as z:
-        for name in ("index.html", asset):
-            p = pathlib.Path(tmp) / name
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_bytes(z.read(name))
-    subprocess.run(["zip", "-q", "-u", dst, "index.html", asset], cwd=tmp, check=True)
-    print("restored our files: index.html + " + asset)
-finally:
-    shutil.rmtree(tmp, ignore_errors=True)
+    updates["index.html"] = z.read("index.html")
+    updates[asset] = z.read(asset)
+# 用 Python zipfile 重写目标 zip（只替换本工具改动的文件，保留其余条目）
+bak = pathlib.Path(dst).with_name(pathlib.Path(dst).name + ".fndesk.restore.bak")
+shutil.copy2(dst, bak)
+tmp_zip = pathlib.Path(dst).with_name(pathlib.Path(dst).name + ".fndesk.tmp")
+with zipfile.ZipFile(dst, "r") as zin, zipfile.ZipFile(tmp_zip, "w") as zout:
+    for item in zin.infolist():
+        if item.filename in updates:
+            zout.writestr(item, updates[item.filename])
+        else:
+            zout.writestr(item, zin.read(item.filename))
+tmp_zip.replace(dst)
+print("restored our files: index.html + " + asset)
 PYEOF
 }
 
