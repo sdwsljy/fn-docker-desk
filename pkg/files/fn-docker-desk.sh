@@ -26,7 +26,7 @@
 set -euo pipefail
 
 # ---------------- 路径与常量 ----------------
-readonly APP_VERSION="1.1.3"                     # 应用版本（与 manifest 保持一致）
+readonly APP_VERSION="1.1.4"                     # 应用版本（与 manifest 保持一致）
 readonly FN_WWW="/usr/trim/www"                 # 飞牛 Web 根目录
 readonly INDEX_HTML="${FN_WWW}/index.html"
 readonly CONF_DIR="/usr/fn-docker-desk"          # 工具配置目录（root 专属，不受 www 重建影响）
@@ -331,7 +331,10 @@ apply_inject() {
     asset=$(python3 - "${INDEX_HTML}" <<'PYEOF'
 import re, sys, pathlib
 s = pathlib.Path(sys.argv[1]).read_text('utf-8', errors='replace')
+# 优先匹配 fnOS 传统主入口 index-*.js，失败时回退 assets 下第一个 js（兼容新版桌面结构）
 m = re.search(r'src="(/assets/index-[^"?]+\.js)(?:\?[^"]*)?"', s)
+if not m:
+    m = re.search(r'src="(/assets/[^"?]+\.js)(?:\?[^"]*)?"', s)
 print(m.group(1).lstrip('/') if m else '')
 PYEOF
 )
@@ -762,8 +765,8 @@ precise_restore_web_zip() {
     command -v python3 >/dev/null 2>&1 || return 1
     command -v zip >/dev/null 2>&1 || return 1
 
+    # 返回值：0=已更新；2=未发现注入（已干净）；非0=处理失败
     python3 - "${restore_zip}" <<'PYEOF'
-import os
 import pathlib
 import re
 import shutil
@@ -775,46 +778,31 @@ import zipfile
 zip_path = pathlib.Path(sys.argv[1])
 tmp = pathlib.Path(tempfile.mkdtemp(prefix="fn-docker-desk-restore."))
 changed = []
+marker = re.compile(r';/\* fn-docker-desk asset injection v[01]\.[0-9.]+ \*/')
 try:
     with zipfile.ZipFile(zip_path, "r") as z:
         names = set(z.namelist())
-        if "index.html" not in names:
-            print("index.html not found in www.zip", file=sys.stderr)
-            sys.exit(1)
-
-        index = z.read("index.html").decode("utf-8", "replace")
-        m = re.search(r'src="(/assets/index-[^"?]+\.js)(?:\?[^"]*)?"', index)
-        if not m:
-            print("main asset not found in index.html", file=sys.stderr)
-            sys.exit(1)
-
-        asset_name = m.group(1).lstrip("/")
-        if asset_name not in names:
-            print("main asset not found in www.zip: %s" % asset_name, file=sys.stderr)
-            sys.exit(1)
-
-        new_index = re.sub(
-            r'src="(/assets/index-[^"?]+\.js)\?v=fndesk[0-9]+"',
-            r'src="\1"',
-            index,
-            count=1,
-        )
-        if new_index != index:
-            (tmp / "index.html").write_text(new_index, "utf-8")
-            changed.append("index.html")
-
-        js = z.read(asset_name).decode("utf-8", "replace")
-        parts = re.split(r';/\* fn-docker-desk asset injection v[01]\.[0-9.]+ \*/', js, maxsplit=1)
-        if len(parts) > 1:
-            new_js = parts[0].rstrip() + "\n"
-            out = tmp / asset_name
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(new_js, "utf-8")
-            changed.append(asset_name)
+        # 1. 清除 index.html 中所有 fndesk 版本参数（不依赖特定 JS 文件名）
+        if "index.html" in names:
+            index = z.read("index.html").decode("utf-8", "replace")
+            new_index = re.sub(r'\?v=fndesk[0-9]+"', '"', index)
+            if new_index != index:
+                (tmp / "index.html").write_text(new_index, "utf-8")
+                changed.append("index.html")
+        # 2. 遍历 assets 下所有 js，清除 fn-docker-desk 注入代码
+        for name in sorted(names):
+            if name.startswith("assets/") and name.endswith(".js"):
+                js = z.read(name).decode("utf-8", "replace")
+                parts = marker.split(js, maxsplit=1)
+                if len(parts) > 1:
+                    out = tmp / name
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    out.write_text(parts[0].rstrip() + "\n", "utf-8")
+                    changed.append(name)
 
     if not changed:
         print("no fn-docker-desk injection found")
-        sys.exit(0)
+        sys.exit(2)
 
     bak = zip_path.with_name(zip_path.name + ".fndesk.restore.bak")
     shutil.copy2(zip_path, bak)
@@ -828,29 +816,35 @@ PYEOF
 precise_restore_runtime_web() {
     [ -f "${INDEX_HTML}" ] || return 1
     command -v python3 >/dev/null 2>&1 || return 1
+    # 返回值：0=已更新；2=未发现注入（已干净）；非0=处理失败
     python3 - "${INDEX_HTML}" <<'PYEOF'
 import pathlib
 import re
 import sys
 
-index = pathlib.Path(sys.argv[1])
-idx = index.read_text("utf-8", errors="replace")
-m = re.search(r'src="(/assets/index-[^"?]+\.js)(?:\?[^"]*)?"', idx)
-if not m:
-    print("main asset not found in runtime index.html", file=sys.stderr)
-    sys.exit(1)
-asset = pathlib.Path("/usr/trim/www") / m.group(1).lstrip("/")
-new_idx = re.sub(r'src="(/assets/index-[^"?]+\.js)\?v=fndesk[0-9]+"', r'src="\1"', idx, count=1)
+idx_path = pathlib.Path(sys.argv[1])
+idx = idx_path.read_text("utf-8", errors="replace")
+# 1. 清除 index.html 中所有 fndesk 版本参数（不依赖特定 JS 文件名）
+new_idx = re.sub(r'\?v=fndesk[0-9]+"', '"', idx)
+changed = False
 if new_idx != idx:
-    index.write_text(new_idx, "utf-8")
-changed = new_idx != idx
-if asset.exists():
-    js = asset.read_text("utf-8", errors="replace")
-    parts = re.split(r';/\* fn-docker-desk asset injection v[01]\.[0-9.]+ \*/', js, maxsplit=1)
-    if len(parts) > 1:
-        asset.write_text(parts[0].rstrip() + "\n", "utf-8")
-        changed = True
+    idx_path.write_text(new_idx, "utf-8")
+    changed = True
+# 2. 遍历 assets 下所有 js，清除 fn-docker-desk 注入代码（覆盖桌面升级后文件名变化的情况）
+marker = re.compile(r';/\* fn-docker-desk asset injection v[01]\.[0-9.]+ \*/')
+assets_dir = pathlib.Path("/usr/trim/www/assets")
+if assets_dir.is_dir():
+    for js_path in sorted(assets_dir.glob("*.js")):
+        try:
+            js = js_path.read_text("utf-8", errors="replace")
+        except Exception:
+            continue
+        parts = marker.split(js, maxsplit=1)
+        if len(parts) > 1:
+            js_path.write_text(parts[0].rstrip() + "\n", "utf-8")
+            changed = True
 print("runtime precise restore " + ("updated" if changed else "no injection found"))
+sys.exit(0 if changed else 2)
 PYEOF
 }
 
@@ -877,6 +871,8 @@ with zipfile.ZipFile(src) as z:
         sys.exit(1)
     index = z.read("index.html").decode("utf-8", "replace")
     m = re.search(r'src="(/assets/index-[^"?]+\.js)(?:\?[^"]*)?"', index)
+    if not m:
+        m = re.search(r'src="(/assets/[^"?]+\.js)(?:\?[^"]*)?"', index)
     if not m or m.group(1).lstrip("/") not in names:
         print("backup zip main asset not found", file=sys.stderr)
         sys.exit(1)
@@ -925,21 +921,35 @@ PYEOF
     # 2. 移除开机重放服务，避免还原后再次注入（保留 Web 面板，避免 pkill 误杀调用方）
     uninstall_persistence --keep-web
 
-    # 3. 优先精准反注入当前运行目录与 www.zip；失败时仅从备份恢复本工具改动的文件
-    precise_restore_runtime_web >/dev/null 2>&1 || true
+    # 3. 精准反注入当前运行目录与 www.zip；任一未生效则从备份恢复本工具改动的文件
+    #    （返回值：0=已更新；2=无注入已干净；1/其他=处理失败）
+    precise_restore_runtime_web >/dev/null 2>&1
+    local runtime_rc=$?
     local restore_zip="/usr/trim/share/.restore/www.zip"
+    local zip_rc=1
+    if [ -f "${restore_zip}" ]; then
+        precise_restore_web_zip "${restore_zip}" >/dev/null 2>&1
+        zip_rc=$?
+    fi
     local restored=0
-    if [ -f "${restore_zip}" ] && precise_restore_web_zip "${restore_zip}"; then
-        restored=1
+    # 运行时与 www.zip 任一成功反注入即视为已还原
+    [ "${runtime_rc}" -eq 0 ] && restored=1
+    [ "${zip_rc}" -eq 0 ] && restored=1
+    # 兜底：运行时 index.html 仍含注入标记时，说明反注入未完全生效
+    if [ -f "${INDEX_HTML}" ] && grep -q 'fndesk' "${INDEX_HTML}"; then
+        log_warn "运行时 index.html 仍含注入标记，反注入未完全生效"
+        restored=0
+    fi
+    if [ "${restored}" -eq 1 ]; then
         systemctl reload trim_nginx.service 2>/dev/null || true
-        log_info "已精准移除 fnOS Web 源包中的 fn-docker-desk 注入"
+        log_info "已精准移除 fnOS Web 源包与运行目录中的 fn-docker-desk 注入"
     else
-        log_warn "精准反注入失败，从备份恢复本工具改动的文件（不整体覆盖，保护应用商城已装应用）"
-        if [ -f "${restore_zip}.fndesk.orig" ] && restore_our_files_from_zip "${restore_zip}" "${restore_zip}.fndesk.orig"; then
+        log_warn "精准反注入未完全生效，从备份恢复本工具改动的文件（不整体覆盖，保护应用商城已装应用）"
+        if [ -f "${restore_zip}" ] && [ -f "${restore_zip}.fndesk.orig" ] && restore_our_files_from_zip "${restore_zip}" "${restore_zip}.fndesk.orig"; then
             restored=1
             systemctl reload trim_nginx.service 2>/dev/null || true
             log_info "已从本工具原始备份恢复改动文件: index.html + 主 JS"
-        elif [ -f "/usr/trim/share/.restore/www.bak" ] && restore_our_files_from_zip "${restore_zip}" "/usr/trim/share/.restore/www.bak"; then
+        elif [ -f "${restore_zip}" ] && [ -f "/usr/trim/share/.restore/www.bak" ] && restore_our_files_from_zip "${restore_zip}" "/usr/trim/share/.restore/www.bak"; then
             restored=1
             systemctl reload trim_nginx.service 2>/dev/null || true
             log_warn "未找到本工具原始备份，已从外部 Fndesk www.bak 恢复改动文件"
