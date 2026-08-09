@@ -841,8 +841,11 @@ if assets_dir.is_dir():
             continue
         parts = marker.split(js, maxsplit=1)
         if len(parts) > 1:
-            js_path.write_text(parts[0].rstrip() + "\n", "utf-8")
-            changed = True
+            try:
+                js_path.write_text(parts[0].rstrip() + "\n", "utf-8")
+                changed = True
+            except Exception:
+                print("failed to clean: %s" % js_path, file=sys.stderr)
 print("runtime precise restore " + ("updated" if changed else "no injection found"))
 sys.exit(0 if changed else 2)
 PYEOF
@@ -858,6 +861,7 @@ restore_our_files_from_zip() {
     python3 - "${dst}" "${src}" <<'PYEOF'
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
