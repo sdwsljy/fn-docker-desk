@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.3
+
+- 按飞牛官方 fnpack 规范修复应用中心手动安装报错：
+  - **移除 manifest 中多余的 `checksum` 空字段**：官方 manifest 规范无此字段，空值可能在应用中心 "Verifying files" 完整性校验阶段触发失败
+  - **`os_min_version` 从 0.9.0 调整为 1.1.8**：与 `platform = all` 的最低支持系统版本（fnOS V1.1.8+）对齐，避免旧系统误判“应用包格式不符合系统版本要求”
+
 ## 1.1.2
 
 - 修复 `download_icon()` 日志污染图标路径的 bug：

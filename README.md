@@ -2,8 +2,8 @@
 
 把 Docker 容器应用一键添加到飞牛 OS（fnOS）桌面。通过飞牛应用中心安装 `.fpk` 应用包后，桌面出现「飞牛桌面图标」入口，可视化地把任意 Docker 容器"钉"到桌面，点击直达服务页面。
 
-- 当前版本：**v1.1.2**
-- 支持平台：fnOS（x86 / ARM）
+- 当前版本：**v1.1.3**
+- 支持平台：fnOS（x86 / ARM，需 V1.1.8+）
 - 开发维护：胖啥胖
 
 ## 功能特性
@@ -30,7 +30,7 @@
 
 ### 应用中心手动安装（推荐）
 
-1. 下载 `fn-docker-desk_1.1.2_all.fpk`
+1. 下载 `fn-docker-desk_1.1.3_all.fpk`
 2. 登录飞牛 NAS 桌面 → 打开「应用中心」→ 左下角「手动安装」
 3. 选择 fpk 文件上传，确认安装
 4. 安装完成后桌面出现「飞牛桌面图标」，点击打开管理面板
@@ -41,7 +41,7 @@
 ### 命令行安装（可选）
 
 ```bash
-sudo appcenter-cli install-fpk /path/to/fn-docker-desk_1.1.2_all.fpk --volume 1
+sudo appcenter-cli install-fpk /path/to/fn-docker-desk_1.1.3_all.fpk --volume 1
 sudo appcenter-cli start fn-docker-desk
 ```
 
@@ -124,7 +124,7 @@ fn-docker-desk restore
 
 ## 系统要求
 
-- 飞牛 OS（fnOS，路径 `/usr/trim/www`）
+- 飞牛 OS（fnOS，路径 `/usr/trim/www`），**需 V1.1.8+**（`platform = all` 要求）
 - Docker（必装）
 - Python 3（系统自带）
 - 命令行工具需要 `jq`、`curl`（`sudo apt install -y jq curl`）
@@ -147,7 +147,7 @@ fn-docker-desk restore
 遵循飞牛官方 fnpack 规范（[官方文档](https://developer.fnnas.com/docs/core-concepts/manifest/)）：
 
 ```
-fn-docker-desk_1.1.2_all.fpk (tar.gz)
+fn-docker-desk_1.1.3_all.fpk (tar.gz)
 ├── manifest              # 应用清单（appname/version/service_port/desktop_uidir...）
 ├── ICON.PNG / ICON_256.PNG
 ├── app.tgz               # 应用文件，解压到 target（含 ui/config 桌面入口注册）
@@ -168,7 +168,7 @@ fn-docker-desk_1.1.2_all.fpk (tar.gz)
 python scripts/build_fpk.py
 ```
 
-脚本只依赖 Python 标准库，输出文件位于 `dist/fn-docker-desk_1.1.2_all.fpk`。
+脚本只依赖 Python 标准库，输出文件位于 `dist/fn-docker-desk_1.1.3_all.fpk`。
 
 ## 开发与测试
 
@@ -230,6 +230,7 @@ GitHub Actions（`.github/workflows/validate.yml`）在 push/PR 时自动运行�
 
 | 版本 | 内容 |
 |------|------|
+| 1.1.3 | 按官方 fnpack 规范修复应用中心手动安装报错：移除 manifest 多余 checksum 空字段；os_min_version 与 platform=all 对齐（fnOS 1.1.8+） |
 | 1.1.2 | 修复 download_icon 日志污染图标路径（日志改走 stderr），避免图标回退首字母 |
 | 1.1.1 | 修复桌面图标反复闪烁：排序前置+差异渲染+DOM存活检查，简化轮询，防抖提升 |
 | 1.1.0 | 修复添加图标时 nginx 重启导致飞牛 OS 断开连接，改用 reload 优雅重载 |
