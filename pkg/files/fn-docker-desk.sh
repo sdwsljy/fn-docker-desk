@@ -922,14 +922,12 @@ PYEOF
     uninstall_persistence --keep-web
 
     # 3. 精准反注入当前运行目录与 www.zip；任一未生效则从备份恢复本工具改动的文件
-    #    （返回值：0=已更新；2=无注入已干净；1/其他=处理失败）
-    precise_restore_runtime_web >/dev/null 2>&1
-    local runtime_rc=$?
+    #    （返回值：0=已更新；2=无注入已干净；1/其他=处理失败；用 || 保护避免 set -e 中断还原）
+    local runtime_rc=0 zip_rc=1
+    precise_restore_runtime_web >/dev/null 2>&1 || runtime_rc=$?
     local restore_zip="/usr/trim/share/.restore/www.zip"
-    local zip_rc=1
     if [ -f "${restore_zip}" ]; then
-        precise_restore_web_zip "${restore_zip}" >/dev/null 2>&1
-        zip_rc=$?
+        precise_restore_web_zip "${restore_zip}" >/dev/null 2>&1 || zip_rc=$?
     fi
     local restored=0
     # 运行时与 www.zip 任一成功反注入即视为已还原
