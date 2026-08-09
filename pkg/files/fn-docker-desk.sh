@@ -787,6 +787,7 @@ try:
         if not m:
             print("main asset not found in index.html", file=sys.stderr)
             sys.exit(1)
+
         asset_name = m.group(1).lstrip("/")
         if asset_name not in names:
             print("main asset not found in www.zip: %s" % asset_name, file=sys.stderr)
