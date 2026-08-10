@@ -77,6 +77,14 @@
   var rendering=false;       // 防止重入
   var lastSig='';            // 数据签名，跳过无变化的重渲染
   var observer=null;         // MutationObserver 实例（渲染期间暂停）
+  // 一键还原后配置清空：移除所有已渲染的 fn-docker-desk 图标（含差异渲染未覆盖的残留）
+  function clearAll(){
+    var t=findTarget(); if(!t)return;
+    var els=t.querySelectorAll('['+MARK+']');
+    for(var i=0;i<els.length;i++){try{els[i].remove();}catch(e){}}
+    lastSig='';
+    window.__fnDeskDiag={ok:true,cleared:els.length,ts:Date.now()};
+  }
   function dataSig(data){
     // 生成数据指纹，用于判断是否需要重渲染（data 已排序，签名稳定）
     return data.map(function(it){return (it['序号']||0)+'|'+(it['标题']||'')+'|'+(it['跳转URL']||'')+'|'+(it['图片URL']||'');}).join(';;');
@@ -86,7 +94,10 @@
     if(rendering)return;          // 防重入
     rendering=true;
     loadIcons().then(function(data){
-      if(!Array.isArray(data)||!data.length){rendering=false;return;}
+      if(!Array.isArray(data)){rendering=false;return;}
+      // ★ 修复：数据为空（一键还原后配置清空）也必须进入差异渲染，
+      //   将已渲染的 fn-docker-desk 图标全部移除，避免图标残留桌面
+      if(!data.length){rendering=false;clearAll();return;}
       // ★ 修复1：先排序再算签名，保证签名稳定
       data.sort(function(a,b){return(a['序号']||0)-(b['序号']||0);});
       var sig=dataSig(data);

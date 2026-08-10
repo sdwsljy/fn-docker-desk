@@ -26,7 +26,7 @@
 set -euo pipefail
 
 # ---------------- 路径与常量 ----------------
-readonly APP_VERSION="1.1.4"                     # 应用版本（与 manifest 保持一致）
+readonly APP_VERSION="1.1.5"                     # 应用版本（与 manifest 保持一致）
 readonly FN_WWW="/usr/trim/www"                 # 飞牛 Web 根目录
 readonly INDEX_HTML="${FN_WWW}/index.html"
 readonly CONF_DIR="/usr/fn-docker-desk"          # 工具配置目录（root 专属，不受 www 重建影响）
