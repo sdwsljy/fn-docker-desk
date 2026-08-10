@@ -973,14 +973,9 @@ PYEOF
     fi
 
     # 4. 彻底清除本工具生成的用户/容器图标配置与图片
-    #    管理面板自身图标（manager）由 fnOS 应用中心管理，保留，不在 icons.json 中记录
+    #    icons.json 仅存用户/容器图标（应用自身入口由 fnOS 应用中心管理，不在此文件），一键还原全部清空
     if [ -f "${CONF_JSON}" ]; then
-        # 仅移除用户自定义/容器图标，保留应用自身图标（若存在）
-        if jq -e 'length > 0' "${CONF_JSON}" >/dev/null 2>&1; then
-            jq '[.[] | select((."类型" // "docker") != "manager" and ."标题" != "飞牛桌面图标")]' \
-               "${CONF_JSON}" > "${CONF_JSON}.tmp" 2>/dev/null && mv "${CONF_JSON}.tmp" "${CONF_JSON}" || \
-               echo '[]' > "${CONF_JSON}"
-        fi
+        echo '[]' > "${CONF_JSON}"
         chmod 644 "${CONF_JSON}"
         log_info "已清空用户/容器图标配置（应用自身图标保留）: ${CONF_JSON}"
     fi
