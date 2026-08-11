@@ -26,7 +26,7 @@
 set -euo pipefail
 
 # ---------------- 路径与常量 ----------------
-readonly APP_VERSION="1.1.2"                     # 应用版本（与 manifest 保持一致）
+readonly APP_VERSION="1.1.6"                     # 应用版本（与 manifest 保持一致）
 readonly FN_WWW="/usr/trim/www"                 # 飞牛 Web 根目录
 readonly INDEX_HTML="${FN_WWW}/index.html"
 readonly CONF_DIR="/usr/fn-docker-desk"          # 工具配置目录（root 专属，不受 www 重建影响）
@@ -44,7 +44,7 @@ readonly MARKER_END="<!-- fn-docker-desk:end -->"
 readonly SERVICE_NAME="fn-docker-desk.service"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 readonly RESTORE_SCRIPT="/usr/local/bin/fn-docker-desk-restore.sh"
-readonly APP_USER="${TRIM_USERNAME:-fn-docker-desk}"  # 专用包用户（web.py 降权运行）
+readonly APP_USER="${TRIM_USERNAME:-fn-docker-desk}"  # 专用包用户（privilege 配置中定义）
 
 # 内置常见应用的图标 URL 映射（键为镜像名关键字，值为图标 URL）
 declare -A ICON_MAP=(
@@ -96,7 +96,7 @@ log_err()   { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; _log_file "[ERROR
 die()       { log_err "$*"; exit 1; }
 
 require_root() {
-    [ "$(id -u)" -eq 0 ] || die "需要 root 权限运行，请使用: sudo $0 $*"
+    [ "$(id -u)" -eq 0 ] || die "需要 root 权限运行，请使用 sudo 执行本脚本"
 }
 
 require_env() {
@@ -110,10 +110,6 @@ init_dirs() {
     mkdir -p "${CONF_DIR}" "${IMAGE_DIR}" "${BACKUP_DIR}"
     chmod -R 755 "${CONF_DIR}"
     [ -f "${CONF_JSON}" ] || echo '[]' > "${CONF_JSON}"
-    # 以 root 运行时，将配置目录归属包用户（web.py 降权后需读写）
-    if [ "$(id -u)" -eq 0 ] && id "${APP_USER}" >/dev/null 2>&1; then
-        chown -R "${APP_USER}:${APP_USER}" "${CONF_DIR}" 2>/dev/null || true
-    fi
 }
 
 # 获取 NAS 局域网 IP
@@ -171,6 +167,13 @@ match_builtin_icon() {
 # 快速失败策略：单个 URL 最多 8s，总耗时超 25s 立即降级，避免卡死添加流程
 download_icon() {
     local url="$1" name="$2" ext="" local_path rel_path total_start now
+    # 仅允许 http/https 远程地址；已是本地 icons/ 相对路径（管理面板上传）则直接引用。
+    # 防止 file:// 等危险协议读取本地文件或触发 SSRF。
+    if [[ "${url}" =~ ^icons/ ]]; then
+        echo "${url}"
+        return 0
+    fi
+    [[ "${url}" =~ ^https?:// ]] || { log_warn "图标 URL 协议不允许（仅 http/https）: ${url}" >&2; return 1; }
     ext=$(echo "${url##*.}" | tr '[:upper:]' '[:lower:]' | cut -d'?' -f1)
     [[ "${ext}" =~ ^(jpg|jpeg|png|gif|bmp|webp|svg|ico)$ ]] || ext="png"
     local_path="${IMAGE_DIR}/${name}.${ext}"
@@ -246,6 +249,10 @@ gen_fallback_icon() {
     local name="$1" letter
     letter=$(printf '%s' "${name}" | cut -c1 | tr '[:lower:]' '[:upper:]')
     [ -z "${letter}" ] && letter="D"
+    # XML 转义首字符，避免 & < > 破坏 SVG
+    letter=${letter//&/&amp;}
+    letter=${letter//</&lt;}
+    letter=${letter//>/&gt;}
     local file="${IMAGE_DIR}/${name}.svg"
     cat > "${file}" <<SVGEOF
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
@@ -263,9 +270,10 @@ SVGEOF
 # 查找容器：支持名称或 ID 前缀
 resolve_container() {
     local query="$1" found
-    found=$(docker ps --format '{{.Names}}' | grep -x "${query}" || true)
+    # 用 -F 固定字符串匹配，避免容器名中的 . 等被当作正则元字符
+    found=$(docker ps --format '{{.Names}}' | grep -Fx "${query}" || true)
     if [ -z "${found}" ]; then
-        found=$(docker ps --format '{{.Names}}' | grep "^${query}" | head -1 || true)
+        found=$(docker ps --format '{{.Names}}' | awk -v q="${query}" 'index($0,q)==1{print; exit}' || true)
     fi
     [ -z "${found}" ] && die "未找到运行中的容器: ${query}（用 list 命令查看）"
     echo "${found}"
@@ -335,7 +343,10 @@ apply_inject() {
     asset=$(python3 - "${INDEX_HTML}" <<'PYEOF'
 import re, sys, pathlib
 s = pathlib.Path(sys.argv[1]).read_text('utf-8', errors='replace')
+# 优先匹配 fnOS 传统主入口 index-*.js，失败时回退 assets 下第一个 js（兼容新版桌面结构）
 m = re.search(r'src="(/assets/index-[^"?]+\.js)(?:\?[^"]*)?"', s)
+if not m:
+    m = re.search(r'src="(/assets/[^"?]+\.js)(?:\?[^"]*)?"', s)
 print(m.group(1).lstrip('/') if m else '')
 PYEOF
 )
@@ -408,6 +419,8 @@ PYEOF
         log_info "已备份 fnOS Web 源包: ${restore_zip}.fndesk.orig"
     fi
     cp -f "${restore_zip}" "${restore_zip}.fndesk.bak.$(date +%Y%m%d%H%M%S)"
+    # 只保留最近 2 个源包备份，避免 50MB+ 级 www.zip 备份堆积占满磁盘
+    ls -1t "${restore_zip}".fndesk.bak.* 2>/dev/null | tail -n +3 | xargs -r rm -f 2>/dev/null || true
     if ! (cd "${tmproot}" && zip -q -u "${restore_zip}" index.html "${asset}") 2>/dev/null; then
         log_warn "更新 fnOS Web 源包失败（当前运行目录已生效，但系统重启后图标可能丢失）"
         return 1
@@ -452,16 +465,11 @@ set -euo pipefail
 if [ -f "${CONF_DIR}/fn-docker-desk.sh" ]; then
     bash "${CONF_DIR}/fn-docker-desk.sh" apply --quiet || true
 fi
-# 确保 Web 管理服务运行（降权运行，回退 root）
+# 确保 Web 管理服务运行（以 root 运行，需调用主脚本 + 访问 docker）
 if [ -f "${CONF_DIR}/web.py" ] && ! pgrep -f "web.py --port ${SVC_PORT:-5558}" >/dev/null 2>&1; then
     touch /var/log/fn-docker-desk-web.log 2>/dev/null || true
     chmod 644 /var/log/fn-docker-desk-web.log 2>/dev/null || true
-    if id "${APP_USER}" >/dev/null 2>&1; then
-        chown -R "${APP_USER}:${APP_USER}" "${CONF_DIR}" 2>/dev/null || true
-        setsid runuser -u "${APP_USER}" -- python3 -u "${CONF_DIR}/web.py" --port ${SVC_PORT:-5558} >>/var/log/fn-docker-desk-web.log 2>&1 < /dev/null &
-    else
-        setsid nohup python3 -u "${CONF_DIR}/web.py" --port ${SVC_PORT:-5558} >>/var/log/fn-docker-desk-web.log 2>&1 < /dev/null &
-    fi
+    setsid nohup python3 -u "${CONF_DIR}/web.py" --port ${SVC_PORT:-5558} >>/var/log/fn-docker-desk-web.log 2>&1 < /dev/null &
 fi
 EOF
     chmod +x "${RESTORE_SCRIPT}"
@@ -771,8 +779,10 @@ precise_restore_web_zip() {
     command -v python3 >/dev/null 2>&1 || return 1
     command -v zip >/dev/null 2>&1 || return 1
 
+    # 返回值：0=已更新；2=未发现注入（已干净）；非0=处理失败
+    # 注意：fnOS 新版桌面 www.zip 含加密条目，zipfile 全量重写会失败，
+    #       因此只读取/更新 index.html 与主 JS，用 zip -u 增量写回（不触碰其他条目）
     python3 - "${restore_zip}" <<'PYEOF'
-import os
 import pathlib
 import re
 import shutil
@@ -782,49 +792,37 @@ import tempfile
 import zipfile
 
 zip_path = pathlib.Path(sys.argv[1])
+marker = re.compile(r';/\* fn-docker-desk asset injection v[01]\.[0-9.]+ \*/')
 tmp = pathlib.Path(tempfile.mkdtemp(prefix="fn-docker-desk-restore."))
-changed = []
 try:
     with zipfile.ZipFile(zip_path, "r") as z:
         names = set(z.namelist())
         if "index.html" not in names:
             print("index.html not found in www.zip", file=sys.stderr)
             sys.exit(1)
-
         index = z.read("index.html").decode("utf-8", "replace")
-        m = re.search(r'src="(/assets/index-[^"?]+\.js)(?:\?[^"]*)?"', index)
-        if not m:
-            print("main asset not found in index.html", file=sys.stderr)
-            sys.exit(1)
-
-        asset_name = m.group(1).lstrip("/")
-        if asset_name not in names:
-            print("main asset not found in www.zip: %s" % asset_name, file=sys.stderr)
-            sys.exit(1)
-
-        new_index = re.sub(
-            r'src="(/assets/index-[^"?]+\.js)\?v=fndesk[0-9]+"',
-            r'src="\1"',
-            index,
-            count=1,
-        )
+        new_index = re.sub(r'\?v=fndesk[0-9]+"', '"', index)
+        changed = []
         if new_index != index:
             (tmp / "index.html").write_text(new_index, "utf-8")
             changed.append("index.html")
-
-        js = z.read(asset_name).decode("utf-8", "replace")
-        parts = re.split(r';/\* fn-docker-desk asset injection v[01]\.[0-9.]+ \*/', js, maxsplit=1)
-        if len(parts) > 1:
-            new_js = parts[0].rstrip() + "\n"
-            out = tmp / asset_name
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(new_js, "utf-8")
-            changed.append(asset_name)
-
+        # 主 JS：优先 index-*.js，回退 assets 下第一个 js
+        m = re.search(r'src="(/assets/index-[^"?]+\.js)(?:\?[^"]*)?"', index)
+        if not m:
+            m = re.search(r'src="(/assets/[^"?]+\.js)(?:\?[^"]*)?"', index)
+        if m:
+            asset = m.group(1).lstrip("/")
+            if asset in names and asset.endswith(".js"):
+                js = z.read(asset).decode("utf-8", "replace")
+                parts = marker.split(js, maxsplit=1)
+                if len(parts) > 1:
+                    out = tmp / asset
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    out.write_text(parts[0].rstrip() + "\n", "utf-8")
+                    changed.append(asset)
     if not changed:
         print("no fn-docker-desk injection found")
-        sys.exit(0)
-
+        sys.exit(2)
     bak = zip_path.with_name(zip_path.name + ".fndesk.restore.bak")
     shutil.copy2(zip_path, bak)
     subprocess.run(["zip", "-q", "-u", str(zip_path), *changed], cwd=str(tmp), check=True)
@@ -837,29 +835,38 @@ PYEOF
 precise_restore_runtime_web() {
     [ -f "${INDEX_HTML}" ] || return 1
     command -v python3 >/dev/null 2>&1 || return 1
+    # 返回值：0=已更新；2=未发现注入（已干净）；非0=处理失败
     python3 - "${INDEX_HTML}" <<'PYEOF'
 import pathlib
 import re
 import sys
 
-index = pathlib.Path(sys.argv[1])
-idx = index.read_text("utf-8", errors="replace")
-m = re.search(r'src="(/assets/index-[^"?]+\.js)(?:\?[^"]*)?"', idx)
-if not m:
-    print("main asset not found in runtime index.html", file=sys.stderr)
-    sys.exit(1)
-asset = pathlib.Path("/usr/trim/www") / m.group(1).lstrip("/")
-new_idx = re.sub(r'src="(/assets/index-[^"?]+\.js)\?v=fndesk[0-9]+"', r'src="\1"', idx, count=1)
+idx_path = pathlib.Path(sys.argv[1])
+idx = idx_path.read_text("utf-8", errors="replace")
+# 1. 清除 index.html 中所有 fndesk 版本参数（不依赖特定 JS 文件名）
+new_idx = re.sub(r'\?v=fndesk[0-9]+"', '"', idx)
+changed = False
 if new_idx != idx:
-    index.write_text(new_idx, "utf-8")
-changed = new_idx != idx
-if asset.exists():
-    js = asset.read_text("utf-8", errors="replace")
-    parts = re.split(r';/\* fn-docker-desk asset injection v[01]\.[0-9.]+ \*/', js, maxsplit=1)
-    if len(parts) > 1:
-        asset.write_text(parts[0].rstrip() + "\n", "utf-8")
-        changed = True
+    idx_path.write_text(new_idx, "utf-8")
+    changed = True
+# 2. 遍历 assets 下所有 js，清除 fn-docker-desk 注入代码（覆盖桌面升级后文件名变化的情况）
+marker = re.compile(r';/\* fn-docker-desk asset injection v[01]\.[0-9.]+ \*/')
+assets_dir = pathlib.Path("/usr/trim/www/assets")
+if assets_dir.is_dir():
+    for js_path in sorted(assets_dir.glob("*.js")):
+        try:
+            js = js_path.read_text("utf-8", errors="replace")
+        except Exception:
+            continue
+        parts = marker.split(js, maxsplit=1)
+        if len(parts) > 1:
+            try:
+                js_path.write_text(parts[0].rstrip() + "\n", "utf-8")
+                changed = True
+            except Exception:
+                print("failed to clean: %s" % js_path, file=sys.stderr)
 print("runtime precise restore " + ("updated" if changed else "no injection found"))
+sys.exit(0 if changed else 2)
 PYEOF
 }
 
@@ -873,6 +880,7 @@ restore_our_files_from_zip() {
     python3 - "${dst}" "${src}" <<'PYEOF'
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -886,6 +894,8 @@ with zipfile.ZipFile(src) as z:
         sys.exit(1)
     index = z.read("index.html").decode("utf-8", "replace")
     m = re.search(r'src="(/assets/index-[^"?]+\.js)(?:\?[^"]*)?"', index)
+    if not m:
+        m = re.search(r'src="(/assets/[^"?]+\.js)(?:\?[^"]*)?"', index)
     if not m or m.group(1).lstrip("/") not in names:
         print("backup zip main asset not found", file=sys.stderr)
         sys.exit(1)
@@ -897,6 +907,7 @@ try:
             p = pathlib.Path(tmp) / name
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_bytes(z.read(name))
+    # 用 zip 命令增量更新（目标 zip 可能含加密条目，zipfile 全量重写会失败）
     subprocess.run(["zip", "-q", "-u", dst, "index.html", asset], cwd=tmp, check=True)
     print("restored our files: index.html + " + asset)
 finally:
@@ -934,21 +945,37 @@ PYEOF
     # 2. 移除开机重放服务，避免还原后再次注入（保留 Web 面板，避免 pkill 误杀调用方）
     uninstall_persistence --keep-web
 
-    # 3. 优先精准反注入当前运行目录与 www.zip；失败时仅从备份恢复本工具改动的文件
-    precise_restore_runtime_web >/dev/null 2>&1 || true
+    # 3. 精准反注入当前运行目录与 www.zip；任一未生效则从备份恢复本工具改动的文件
+    #    （返回值：0=已更新；2=无注入已干净；1/其他=处理失败；用 || 保护避免 set -e 中断还原）
+    local runtime_rc=0 zip_rc=1
+    precise_restore_runtime_web >/dev/null 2>&1 || runtime_rc=$?
     local restore_zip="/usr/trim/share/.restore/www.zip"
+    if [ -f "${restore_zip}" ]; then
+        precise_restore_web_zip "${restore_zip}" >/dev/null 2>&1 || zip_rc=$?
+    fi
     local restored=0
-    if [ -f "${restore_zip}" ] && precise_restore_web_zip "${restore_zip}"; then
-        restored=1
+    # 运行时与 www.zip 任一成功反注入即视为已还原
+    [ "${runtime_rc}" -eq 0 ] && restored=1
+    [ "${zip_rc}" -eq 0 ] && restored=1
+    # 兜底：运行时 index.html 仍含注入标记时，说明反注入未完全生效
+    if [ -f "${INDEX_HTML}" ] && grep -q 'fndesk' "${INDEX_HTML}"; then
+        log_warn "运行时 index.html 仍含注入标记，反注入未完全生效"
+        restored=0
+    fi
+    if [ "${restored}" -eq 1 ]; then
         systemctl reload trim_nginx.service 2>/dev/null || true
-        log_info "已精准移除 fnOS Web 源包中的 fn-docker-desk 注入"
+        if [ "${zip_rc}" -eq 0 ] || [ "${zip_rc}" -eq 2 ]; then
+            log_info "已精准移除 fnOS Web 源包与运行目录中的 fn-docker-desk 注入"
+        else
+            log_warn "运行目录注入已移除，但 fnOS Web 源包（www.zip）更新失败，系统重建桌面后注入可能复活，建议重启应用或手动检查 www.zip"
+        fi
     else
-        log_warn "精准反注入失败，从备份恢复本工具改动的文件（不整体覆盖，保护应用商城已装应用）"
-        if [ -f "${restore_zip}.fndesk.orig" ] && restore_our_files_from_zip "${restore_zip}" "${restore_zip}.fndesk.orig"; then
+        log_warn "精准反注入未完全生效，从备份恢复本工具改动的文件（不整体覆盖，保护应用商城已装应用）"
+        if [ -f "${restore_zip}" ] && [ -f "${restore_zip}.fndesk.orig" ] && restore_our_files_from_zip "${restore_zip}" "${restore_zip}.fndesk.orig"; then
             restored=1
             systemctl reload trim_nginx.service 2>/dev/null || true
             log_info "已从本工具原始备份恢复改动文件: index.html + 主 JS"
-        elif [ -f "/usr/trim/share/.restore/www.bak" ] && restore_our_files_from_zip "${restore_zip}" "/usr/trim/share/.restore/www.bak"; then
+        elif [ -f "${restore_zip}" ] && [ -f "/usr/trim/share/.restore/www.bak" ] && restore_our_files_from_zip "${restore_zip}" "/usr/trim/share/.restore/www.bak"; then
             restored=1
             systemctl reload trim_nginx.service 2>/dev/null || true
             log_warn "未找到本工具原始备份，已从外部 Fndesk www.bak 恢复改动文件"
@@ -958,14 +985,9 @@ PYEOF
     fi
 
     # 4. 彻底清除本工具生成的用户/容器图标配置与图片
-    #    管理面板自身图标（manager）由 fnOS 应用中心管理，保留，不在 icons.json 中记录
+    #    icons.json 仅存用户/容器图标（应用自身入口由 fnOS 应用中心管理，不在此文件），一键还原全部清空
     if [ -f "${CONF_JSON}" ]; then
-        # 仅移除用户自定义/容器图标，保留应用自身图标（若存在）
-        if jq -e 'length > 0' "${CONF_JSON}" >/dev/null 2>&1; then
-            jq '[.[] | select((."类型" // "docker") != "manager" and ."标题" != "飞牛桌面图标")]' \
-               "${CONF_JSON}" > "${CONF_JSON}.tmp" 2>/dev/null && mv "${CONF_JSON}.tmp" "${CONF_JSON}" || \
-               echo '[]' > "${CONF_JSON}"
-        fi
+        echo '[]' > "${CONF_JSON}"
         chmod 644 "${CONF_JSON}"
         log_info "已清空用户/容器图标配置（应用自身图标保留）: ${CONF_JSON}"
     fi
@@ -1061,14 +1083,8 @@ cmd_uninstall() {
     precise_restore_runtime_web >/dev/null 2>&1 || true
     precise_restore_web_zip "/usr/trim/share/.restore/www.zip" >/dev/null 2>&1 || true
     systemctl reload trim_nginx.service 2>/dev/null || true
-    # 3. 移除自启注入服务
+    # 3. 移除自启注入服务（顺带停止 web.py 进程 + daemon-reload）
     uninstall_persistence
-    # 4. 停止并清理 web 托管服务（fn-docker-desk-web.service）
-    systemctl stop fn-docker-desk-web.service >/dev/null 2>&1 || true
-    systemctl disable fn-docker-desk-web.service >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/fn-docker-desk-web.service 2>/dev/null || true
-    systemctl daemon-reload 2>/dev/null || true
-    pkill -f "web.py --port ${SVC_PORT:-5558}" 2>/dev/null || true
     log_info "温和卸载完成：已移除注入与自启服务，用户图标配置已备份到 ${APPDATA_DIR}"
 }
 

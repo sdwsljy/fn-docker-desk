@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.1.6
+
+- 安全与稳定性修复（不加鉴权，保持内网工具定位）：
+  - **升级后 Web 面板失效修复**：`upgrade_callback` 误用 `runuser` 降权运行 web.py，导致 add/remove/apply/restore 触发主脚本 `require_root` 全部失败；现统一以 root 启动，与 `main`/`install_callback` 一致
+  - **图标 URL scheme 校验**：`download_icon` 与 web.py 入口强制 `^https?://`（本地 `icons/` 上传路径直接引用），防止 `file://` 读取本地文件与 SSRF；顺带修复上传图标从未生效的问题
+  - **CORS 收窄**：仅 `/api/icons` 放行跨域（注入桌面 JS 需要），写接口不再 `Access-Control-Allow-Origin: *`，消除跨站驱动式调用
+  - **写接口并发锁**：`ThreadingHTTPServer` 下用 `WRITE_LOCK` 串行化 add/add-custom/remove/apply/restore，保护 `icons.json` 读改写
+  - **上传图片校验**：`handle_upload` 增加 magic bytes 判定，拒绝非图片数据
+  - **死代码清理**：移除从未创建的 `fn-docker-desk-web.service` 全部引用
+  - **容器名匹配**：`resolve_container` 改固定字符串匹配，避免 `.` 等被当正则元字符
+  - **SVG 占位转义**：`gen_fallback_icon` 对首字符做 XML 转义
+  - **打包脚本**：`add_file` 按 shebang 判定可执行位，取代硬编码文件名清单
+  - 同步仓库根目录冗余 `fn-docker-desk.sh` 副本至最新
+
 ## 1.1.5
 
 - 修复一键还原后桌面图标无法移除：

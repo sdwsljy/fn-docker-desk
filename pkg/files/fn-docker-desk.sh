@@ -26,7 +26,7 @@
 set -euo pipefail
 
 # ---------------- 路径与常量 ----------------
-readonly APP_VERSION="1.1.5"                     # 应用版本（与 manifest 保持一致）
+readonly APP_VERSION="1.1.6"                     # 应用版本（与 manifest 保持一致）
 readonly FN_WWW="/usr/trim/www"                 # 飞牛 Web 根目录
 readonly INDEX_HTML="${FN_WWW}/index.html"
 readonly CONF_DIR="/usr/fn-docker-desk"          # 工具配置目录（root 专属，不受 www 重建影响）
@@ -96,7 +96,7 @@ log_err()   { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; _log_file "[ERROR
 die()       { log_err "$*"; exit 1; }
 
 require_root() {
-    [ "$(id -u)" -eq 0 ] || die "需要 root 权限运行，请使用: sudo $0 $*"
+    [ "$(id -u)" -eq 0 ] || die "需要 root 权限运行，请使用 sudo 执行本脚本"
 }
 
 require_env() {
@@ -167,6 +167,13 @@ match_builtin_icon() {
 # 快速失败策略：单个 URL 最多 8s，总耗时超 25s 立即降级，避免卡死添加流程
 download_icon() {
     local url="$1" name="$2" ext="" local_path rel_path total_start now
+    # 仅允许 http/https 远程地址；已是本地 icons/ 相对路径（管理面板上传）则直接引用。
+    # 防止 file:// 等危险协议读取本地文件或触发 SSRF。
+    if [[ "${url}" =~ ^icons/ ]]; then
+        echo "${url}"
+        return 0
+    fi
+    [[ "${url}" =~ ^https?:// ]] || { log_warn "图标 URL 协议不允许（仅 http/https）: ${url}" >&2; return 1; }
     ext=$(echo "${url##*.}" | tr '[:upper:]' '[:lower:]' | cut -d'?' -f1)
     [[ "${ext}" =~ ^(jpg|jpeg|png|gif|bmp|webp|svg|ico)$ ]] || ext="png"
     local_path="${IMAGE_DIR}/${name}.${ext}"
@@ -242,6 +249,10 @@ gen_fallback_icon() {
     local name="$1" letter
     letter=$(printf '%s' "${name}" | cut -c1 | tr '[:lower:]' '[:upper:]')
     [ -z "${letter}" ] && letter="D"
+    # XML 转义首字符，避免 & < > 破坏 SVG
+    letter=${letter//&/&amp;}
+    letter=${letter//</&lt;}
+    letter=${letter//>/&gt;}
     local file="${IMAGE_DIR}/${name}.svg"
     cat > "${file}" <<SVGEOF
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
@@ -259,9 +270,10 @@ SVGEOF
 # 查找容器：支持名称或 ID 前缀
 resolve_container() {
     local query="$1" found
-    found=$(docker ps --format '{{.Names}}' | grep -x "${query}" || true)
+    # 用 -F 固定字符串匹配，避免容器名中的 . 等被当作正则元字符
+    found=$(docker ps --format '{{.Names}}' | grep -Fx "${query}" || true)
     if [ -z "${found}" ]; then
-        found=$(docker ps --format '{{.Names}}' | grep "^${query}" | head -1 || true)
+        found=$(docker ps --format '{{.Names}}' | awk -v q="${query}" 'index($0,q)==1{print; exit}' || true)
     fi
     [ -z "${found}" ] && die "未找到运行中的容器: ${query}（用 list 命令查看）"
     echo "${found}"
@@ -1071,14 +1083,8 @@ cmd_uninstall() {
     precise_restore_runtime_web >/dev/null 2>&1 || true
     precise_restore_web_zip "/usr/trim/share/.restore/www.zip" >/dev/null 2>&1 || true
     systemctl reload trim_nginx.service 2>/dev/null || true
-    # 3. 移除自启注入服务
+    # 3. 移除自启注入服务（顺带停止 web.py 进程 + daemon-reload）
     uninstall_persistence
-    # 4. 停止并清理 web 托管服务（fn-docker-desk-web.service）
-    systemctl stop fn-docker-desk-web.service >/dev/null 2>&1 || true
-    systemctl disable fn-docker-desk-web.service >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/fn-docker-desk-web.service 2>/dev/null || true
-    systemctl daemon-reload 2>/dev/null || true
-    pkill -f "web.py --port ${SVC_PORT:-5558}" 2>/dev/null || true
     log_info "温和卸载完成：已移除注入与自启服务，用户图标配置已备份到 ${APPDATA_DIR}"
 }
 

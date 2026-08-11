@@ -467,4 +467,5 @@ class TestVersionConsistency:
         pytest.fail("version not found in manifest")
 
     def test_server_version_string(self, web_module):
-        assert "1.0" in web_module.Handler.server_version
+        assert "fn-docker-desk" in web_module.Handler.server_version
+        assert web_module.APP_VERSION in web_module.Handler.server_version

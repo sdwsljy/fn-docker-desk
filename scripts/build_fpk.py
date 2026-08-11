@@ -33,19 +33,9 @@ def read_manifest_version() -> str:
 
 def add_file(tar: tarfile.TarFile, source: Path, arcname: str) -> None:
     info = tar.gettarinfo(str(source), arcname)
-    if source.name in {
-        "main",
-        "install_init",
-        "install_callback",
-        "upgrade_init",
-        "upgrade_callback",
-        "uninstall_init",
-        "uninstall_callback",
-        "config_init",
-        "config_callback",
-        "fn-docker-desk.sh",
-    }:
-        info.mode = 0o755
+    # 含 shebang 的脚本设为可执行，其余普通文件 0644
+    with source.open("rb") as fh:
+        info.mode = 0o755 if fh.read(2) == b"#!" else 0o644
     with source.open("rb") as fh:
         tar.addfile(info, fh)
 

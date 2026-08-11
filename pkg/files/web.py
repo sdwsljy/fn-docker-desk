@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-飞牛桌面图标 v1.1.5 - Web 管理界面
+飞牛桌面图标 v1.1.6 - Web 管理界面
 ================================
 把 Docker 容器应用一键添加到飞牛桌面的管理面板。
 
@@ -36,6 +36,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -45,7 +46,10 @@ BACKUP_DIR = "/usr/fn-docker-desk/backup"
 ICON_DIR = "/usr/fn-docker-desk/icons"
 LOG_FILE = "/var/log/fn-docker-desk.log"
 DEFAULT_PORT = 5558
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.6"
+
+# 写操作互斥锁：ThreadingHTTPServer 并发请求下保护 icons.json 读改写
+WRITE_LOCK = threading.Lock()
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -53,6 +57,35 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 def clean_output(s):
     """去掉脚本输出里的 ANSI 颜色码，便于界面/日志阅读"""
     return ANSI_RE.sub("", s or "")
+
+
+def valid_icon(icon):
+    """图标地址仅允许 http/https 远程地址或本地 icons/ 相对路径（防 file:// / SSRF）"""
+    if not icon:
+        return True
+    return icon.startswith("icons/") or bool(re.match(r"^https?://", icon))
+
+
+def _is_image(raw):
+    """通过 magic bytes 判断是否为常见图片格式（防上传伪装的可执行/任意文件）"""
+    if not raw:
+        return False
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if raw.startswith(b"\xff\xd8\xff"):
+        return True
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return True
+    if raw.startswith(b"BM"):
+        return True
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return True
+    if raw[:4] in (b"\x00\x00\x01\x00", b"\x00\x00\x02\x00"):
+        return True
+    head = raw[:512].lstrip().lower()
+    if head.startswith(b"<?xml") or head.startswith(b"<svg") or b"<svg" in head:
+        return True
+    return False
 
 
 def run_script(*args, timeout=120):
@@ -303,7 +336,7 @@ body::before {
   <div class="term">
     <div class="term-bar">
       <div class="dots"><i></i><i></i><i></i></div>
-      <div class="term-title"><b>fn-docker-desk</b> · 桌面图标管理 <span class="ver">v1.1.5</span></div>
+      <div class="term-title"><b>fn-docker-desk</b> · 桌面图标管理 <span class="ver">v1.1.6</span></div>
       <div class="term-addr">NAS&nbsp;<b id="externalUrl">检测中…</b></div>
     </div>
     <div class="term-body">
@@ -720,9 +753,9 @@ window.onload = go;
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "fn-docker-desk/1.1.5"
+    server_version = "fn-docker-desk/1.1.6"
 
-    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+    def _send(self, code, body, ctype="application/json; charset=utf-8", cors=False):
         if isinstance(body, str):
             data = body.encode("utf-8")
         else:
@@ -731,14 +764,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        # 仅对注入桌面 JS 需跨域的 /api/icons 放行 CORS；写接口同源访问，
+        # 避免 CORS * 叠加无鉴权被跨站驱动式调用
+        if cors:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
         self.wfile.write(data)
 
-    def send_json(self, obj):
-        self._send(200, json.dumps(obj, ensure_ascii=False))
+    def send_json(self, obj, cors=False):
+        self._send(200, json.dumps(obj, ensure_ascii=False), cors=cors)
 
     def send_html(self, html):
         self._send(200, html, "text/html; charset=utf-8")
@@ -752,7 +788,7 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == "/api/containers":
             self.send_json({"ok": True, "list": get_containers()})
         elif u.path == "/api/icons":
-            self.send_json({"ok": True, "list": get_icons()})
+            self.send_json({"ok": True, "list": get_icons()}, cors=True)
         elif u.path == "/api/backups":
             self.send_json({"ok": True, "list": get_backups()})
         elif u.path == "/api/ip":
@@ -810,6 +846,9 @@ class Handler(BaseHTTPRequestHandler):
             if not raw:
                 self.send_json({"ok": False, "output": "图片数据为空"})
                 return
+            if not _is_image(raw):
+                self.send_json({"ok": False, "output": "非支持的图片格式"})
+                return
             os.makedirs(ICON_DIR, exist_ok=True)
             fp = os.path.join(ICON_DIR, name + ".png")
             with open(fp, "wb") as f:
@@ -840,10 +879,14 @@ class Handler(BaseHTTPRequestHandler):
             if not re.match(r"^https?://", url):
                 self.send_json({"ok": False, "output": "链接必须以 http:// 或 https:// 开头"})
                 return
+            if icon and not valid_icon(icon):
+                self.send_json({"ok": False, "output": "图标地址仅支持 http/https 或本地 icons/ 路径"})
+                return
             args = ["add-custom", "--title", title, "--url", url]
             if icon:
                 args += ["--icon", icon]
-            code, out = run_script(*args, timeout=180)
+            with WRITE_LOCK:
+                code, out = run_script(*args, timeout=180)
             self.send_json({"ok": code == 0, "output": out[-4000:]})
         elif u.path == "/api/add":
             container = (qs.get("container") or [""])[0].strip()
@@ -854,6 +897,9 @@ class Handler(BaseHTTPRequestHandler):
             name = (qs.get("name") or [""])[0].strip()
             port = (qs.get("port") or [""])[0].strip()
             icon = (qs.get("icon") or [""])[0].strip()
+            if icon and not valid_icon(icon):
+                self.send_json({"ok": False, "output": "图标地址仅支持 http/https 或本地 icons/ 路径"})
+                return
             if name:
                 args += ["--name", name]
             if port:
@@ -863,20 +909,24 @@ class Handler(BaseHTTPRequestHandler):
                 args += ["--port", port]
             if icon:
                 args += ["--icon", icon]
-            code, out = run_script(*args, timeout=180)
+            with WRITE_LOCK:
+                code, out = run_script(*args, timeout=180)
             self.send_json({"ok": code == 0, "output": out[-4000:]})
         elif u.path == "/api/remove":
             key = (qs.get("id") or [""])[0].strip()
             if not key:
                 self.send_json({"ok": False, "output": "缺少序号"})
                 return
-            code, out = run_script("remove", key)
+            with WRITE_LOCK:
+                code, out = run_script("remove", key)
             self.send_json({"ok": code == 0, "output": out[-4000:]})
         elif u.path == "/api/apply":
-            code, out = run_script("apply", timeout=180)
+            with WRITE_LOCK:
+                code, out = run_script("apply", timeout=180)
             self.send_json({"ok": code == 0, "output": out[-4000:]})
         elif u.path == "/api/restore":
-            code, out = run_script("restore")
+            with WRITE_LOCK:
+                code, out = run_script("restore")
             self.send_json({"ok": code == 0, "output": out[-4000:]})
         else:
             self.send_json({"ok": False, "output": "404"})
