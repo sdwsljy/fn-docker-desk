@@ -31,7 +31,7 @@ set -euo pipefail
 # - TRIM_PKGVAR  = /var/apps/{appname}/var      : 持久数据（升级/重装保留）
 # - TRIM_PKGETC  = /var/apps/{appname}/etc      : 应用配置目录
 # 命令行独立调用（非生命周期上下文）时可能未注入 TRIM_*，提供默认兜底。
-readonly APP_VERSION="1.1.17"                               # 应用版本（与 manifest 保持一致）
+readonly APP_VERSION="1.1.18"                               # 应用版本（与 manifest 保持一致）
 readonly FN_WWW="/usr/trim/www"                            # 飞牛 Web 根目录（系统级，不受升级影响）
 readonly INDEX_HTML="${FN_WWW}/index.html"
 
@@ -157,6 +157,50 @@ init_dirs() {
     [ -f "${CONF_JSON}" ] || echo '[]' > "${CONF_JSON}"
     # 从旧版非官方路径（/usr/fn-docker-desk）一次性迁移现有数据（幂等：仅在新目录为空时执行）
     migrate_legacy_paths
+    # 自愈：修复 v1.1.7 之前 remove_icon bug 留下的损坏结构
+    # （保留项外层多了 key/value 字段，导致 标题/跳转URL/图片URL 丢失）
+    normalize_icons_json
+}
+
+# 自愈：修复 v1.1.7 之前 remove_icon 函数 jq bug 产生的损坏 icons.json
+# 损坏结构形如：{"key":N, "value":{"序号":X,"标题":..., ...}, "序号":Y}
+# 正常结构形如：{"序号":X, "标题":..., "跳转URL":..., "图片URL":..., ...}
+# 修复策略：对每个元素，若同时含 key 与 value 字段则取 .value，否则保留原值；
+#           然后统一按数组位置重算 序号（1-based），保证紧凑无空洞。
+# 幂等：数据已是正常结构时，至多重算一次序号，不影响内容；损坏数据则一次性修复。
+normalize_icons_json() {
+    [ -f "${CONF_JSON}" ] || return 0
+    # 先检测是否需要修复（避免对正常数据每次都做写操作，减少磁盘 IO 与并发风险）
+    local need_fix=0
+    need_fix=$(jq -r '
+        if type != "array" then 0
+        else (map(select(has("key") and has("value"))) | length)
+        end
+    ' "${CONF_JSON}" 2>/dev/null || echo 0)
+    [ "${need_fix}" -gt 0 ] || return 0
+    log_warn "检测到 icons.json 含损坏结构（${need_fix} 项），开始自动修复..."
+    local tmp="${CONF_JSON}.normalize.$$"
+    if jq '
+        [ .[] | (if (has("key") and has("value")) then .value else . end) ]
+        | to_entries
+        | map(.value + {"序号": (.key + 1)})
+    ' "${CONF_JSON}" > "${tmp}" 2>/dev/null; then
+        # 校验输出是合法 JSON 数组后再覆盖（失败则保留原文件，避免损坏加剧）
+        if jq -e 'type == "array"' "${tmp}" >/dev/null 2>&1; then
+            mv -f "${tmp}" "${CONF_JSON}"
+            chmod 644 "${CONF_JSON}" 2>/dev/null || true
+            log_info "icons.json 已修复：所有图标结构恢复正常并重排序号"
+            # 同步发布到桌面读取的 DEST_JSON，让前端立即拿到正确数据
+            cp -f "${CONF_JSON}" "${DEST_JSON}" 2>/dev/null || true
+            [ -d "${FN_WWW}/userimg" ] && cp -f "${CONF_JSON}" "${LEGACY_JSON}" 2>/dev/null || true
+        else
+            rm -f "${tmp}" 2>/dev/null
+            log_err "icons.json 修复失败：规范化后非合法数组，保留原文件"
+        fi
+    else
+        rm -f "${tmp}" 2>/dev/null
+        log_err "icons.json 修复失败：jq 处理异常，保留原文件"
+    fi
 }
 
 # 升级到官方路径结构：旧版本使用 /usr/fn-docker-desk 存放全部数据；
@@ -431,18 +475,22 @@ remove_icon() {
     if [ "${count}" -eq 0 ] || [ "${count}" = "0" ]; then
         die "未找到匹配的图标（序号/位置序号/标题）: ${key}"
     fi
+    # 🔴 修复 v1.1.7 之前的 bug：旧代码末尾多了一个 to_entries，
+    #   把已经清理过的 [{key,value}] 再转一次 entries，导致保留项变成
+    #   {key, value:{...}, 序号} 三层结构，外层丢失 标题/跳转URL/图片URL，
+    #   表现为"删除某个图标后其它图标全部损坏"。
+    # 正确做法：先过滤保留项 → 提取 .value → 重新 to_entries 得到新索引 → 重算序号。
     jq --arg k "$key" '
-        # ① 删除匹配项（3 种匹配方式）
-        (to_entries | map(
-            select(
-                (.value["序号"]|tostring) == $k or
-                (.value["标题"]) == $k or
-                ((.key + 1)|tostring) == $k
-            ) | .key
-        )) as $to_del |
-        to_entries | map(select([.key] | inside($to_del | map(.)) | not)) |
-        # ② 删除后重新紧凑序号（→1,2,3... 避免显示 [2][3] 混乱）
-        to_entries | map(.value + {"序号": (.key + 1)})
+        [ to_entries[]
+          | select(
+              (.value["序号"]|tostring) != $k and
+              (.value["标题"]) != $k and
+              ((.key + 1)|tostring) != $k
+            )
+          | .value
+        ]
+        | to_entries
+        | map(.value + {"序号": (.key + 1)})
     ' "${CONF_JSON}" > "${CONF_JSON}.tmp" && mv "${CONF_JSON}.tmp" "${CONF_JSON}"
     log_info "已移除: ${key}"
 }
