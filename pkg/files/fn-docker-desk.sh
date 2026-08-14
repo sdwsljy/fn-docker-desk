@@ -31,7 +31,7 @@ set -euo pipefail
 # - TRIM_PKGVAR  = /var/apps/{appname}/var      : 持久数据（升级/重装保留）
 # - TRIM_PKGETC  = /var/apps/{appname}/etc      : 应用配置目录
 # 命令行独立调用（非生命周期上下文）时可能未注入 TRIM_*，提供默认兜底。
-readonly APP_VERSION="1.1.18"                               # 应用版本（与 manifest 保持一致）
+readonly APP_VERSION="1.1.19"                               # 应用版本（与 manifest 保持一致）
 readonly FN_WWW="/usr/trim/www"                            # 飞牛 Web 根目录（系统级，不受升级影响）
 readonly INDEX_HTML="${FN_WWW}/index.html"
 
