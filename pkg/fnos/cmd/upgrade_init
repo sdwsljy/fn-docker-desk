@@ -1,3 +1,30 @@
 #!/bin/bash
-# 飞牛桌面图标 - 升级前（占位）
+# ============================================================
+# fn-docker-desk - 升级前预处理
+# ------------------------------------------------------------
+# 目标：确保升级后 apply 能正确触发 v1.x→v2.0 迁移逻辑。
+# 做法：清掉 PKG_VAR / APPDATA_DIR 下任何旧版本的 .upgrade_migrated_* 标记，
+#       并清掉已经存在的相同版本迁移标记（避免升级前本版本已安装过一遍 + 旧 marker
+#       残留导致 upgrade_callback 内 apply 认为"迁移已完成"而跳过）。
+#
+# 注意：这里 **不** 删除真正的用户数据（icons.json / icons 图片 / APPDATA 备份），
+#       只清升级迁移状态标记；真正删除 BACKUP_DIR 旧备份是在 upgrade_callback
+#       中 apply → cmd_apply → upgrade_migration_cleanup_and_recreate 内部完成。
+# ============================================================
+set -uo pipefail
+
+readonly APP_NAME="${TRIM_APPNAME:-fn-docker-desk}"
+readonly APP_DIR="/var/apps/${APP_NAME}"
+readonly PKG_VAR="${TRIM_PKGVAR:-${APP_DIR}/var}"
+readonly APPDATA_DIR="${TRIM_APPDEST_VOL:-/usr/local/apps/@appdata}/${APP_NAME}"
+
+# PKG_VAR 下清掉所有历史 upgrade_migrated 标记（包括同版本，强制让升级后 apply 重新判定）
+if [ -d "${PKG_VAR}" ]; then
+    rm -f "${PKG_VAR}/.upgrade_migrated_v"* 2>/dev/null || true
+fi
+# APPDATA_DIR 兜底路径同步清除
+if [ -d "${APPDATA_DIR}" ]; then
+    rm -f "${APPDATA_DIR}/.upgrade_migrated_v"* 2>/dev/null || true
+fi
+
 exit 0

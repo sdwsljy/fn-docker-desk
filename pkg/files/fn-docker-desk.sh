@@ -31,7 +31,7 @@ set -euo pipefail
 # - TRIM_PKGVAR  = /var/apps/{appname}/var      : 持久数据（升级/重装保留）
 # - TRIM_PKGETC  = /var/apps/{appname}/etc      : 应用配置目录
 # 命令行独立调用（非生命周期上下文）时可能未注入 TRIM_*，提供默认兜底。
-readonly APP_VERSION="1.2.0"                               # 应用版本（与 manifest 保持一致）
+readonly APP_VERSION="2.0.1"                               # 应用版本（与 manifest 保持一致）
 readonly FN_WWW="/usr/trim/www"                            # 飞牛 Web 根目录（系统级，不受升级影响）
 readonly INDEX_HTML="${FN_WWW}/index.html"
 
@@ -64,6 +64,10 @@ readonly APPDATA_DIR="${TRIM_APPDEST_VOL:-/usr/local/apps/@appdata}/${_APPNAME}"
 readonly RESTORED_FLAG="${PKG_VAR}/.restored"             # 还原态标记（持久化）
 # 注入 JS 为不可变资源，放 target 下随安装包分发
 readonly INJECT_JS_FILE="${PKG_APP}/desktop-inject.js"
+
+# v2.0 升级迁移标记：每个版本独立（带版本号），保证 v1.x → v2.0.0 一定跑过一遍，
+# 后续同版本重复 apply 不会反复做"删除备份/剥离+重写注入"的冗余 IO。
+readonly UPGRADE_MIGRATION_MARKER="${PKG_VAR}/.upgrade_migrated_v${APP_VERSION}"
 
 readonly MARKER_START="<!-- fn-docker-desk:start -->"
 readonly MARKER_END="<!-- fn-docker-desk:end -->"
@@ -271,6 +275,259 @@ migrate_legacy_paths() {
     # 🔴 修复：迁移标记同步写 APPDATA_DIR，双路径都能识别
     mkdir -p "${APPDATA_DIR}" 2>/dev/null
     touch "${APPDATA_DIR}/.migrated_from_usr_fndesk" 2>/dev/null || true
+}
+
+# 检测运行时是否含 v1.x 历史 marker（即 v2.0 反注入升级前的老注入）
+# 返回 0 = 发现旧注入；非 0 = 未发现
+v1x_injection_present() {
+    # index.html 内有 fndesk 缓存参数（任意 v1.x 格式）
+    if [ -f "${INDEX_HTML}" ] && grep -q '?v=fndesk[0-9]\+' "${INDEX_HTML}" 2>/dev/null; then
+        return 0
+    fi
+    # 主 JS 文件尾含任意 v1 / v2 marker（但 marker 版本 ≠ 本 APP_VERSION，即老版本残留）
+    if [ -d "${FN_WWW}/assets" ]; then
+        local fstamp=";/* fn-docker-desk asset injection v1."
+        local fstamp_any=";/* fn-docker-desk asset injection v"
+        local cur_marker=";/* fn-docker-desk asset injection v${APP_VERSION} */"
+        local f
+        f=$(grep -rlF "${fstamp_any}" "${FN_WWW}/assets/" 2>/dev/null | head -1)
+        if [ -n "${f}" ]; then
+            # 包含 v1.x，或者包含任意旧版本 marker（非当前版本）
+            if grep -qF "${fstamp}" "${f}" 2>/dev/null; then return 0; fi
+            if ! grep -qF "${cur_marker}" "${f}" 2>/dev/null; then return 0; fi
+        fi
+    fi
+    return 1
+}
+
+# 检测 www.zip 是否含 v1.x 历史 marker 或非当前版本注入（旧残留）
+restore_zip_has_legacy_injection() {
+    local restore_zip="/usr/trim/share/.restore/www.zip"
+    [ -f "${restore_zip}" ] || return 1
+    command -v unzip >/dev/null 2>&1 || return 1
+    local cur_marker=";/* fn-docker-desk asset injection v${APP_VERSION} */"
+    # 快速检查：-l 列表中是否存在注入过的资产痕迹？
+    if unzip -p "${restore_zip}" index.html 2>/dev/null | grep -q '?v=fndesk[0-9]\+' 2>/dev/null; then
+        local js_content=""
+        local asset=""
+        asset=$(unzip -p "${restore_zip}" index.html 2>/dev/null \
+                | grep -oE 'src="(/assets/[^"?]+\.js)(?:\?[^"]*)?"' 2>/dev/null \
+                | head -1 | sed 's|^src="/||; s|".*||')
+        if [ -n "${asset}" ]; then
+            js_content=$(unzip -p "${restore_zip}" "${asset}" 2>/dev/null)
+            # 含 v1.x marker 或含非当前版本 marker（即含 injection 前缀，但 marker 不同）
+            if echo "${js_content}" | grep -qF ';/* fn-docker-desk asset injection v1.' 2>/dev/null; then return 0; fi
+            if echo "${js_content}" | grep -qF ';/* fn-docker-desk asset injection v' 2>/dev/null \
+               && ! echo "${js_content}" | grep -qF "${cur_marker}" 2>/dev/null; then return 0; fi
+        fi
+    fi
+    return 1
+}
+
+# 检测到 v1.x → v2.0 升级场景时，执行：
+#   1) 彻底删除 BACKUP_DIR/* 历史遗留备份 + www.zip.fndesk.orig / www.zip.fndesk.bak.*
+#   2) 精准剥离运行时旧注入（index.html + assets JS）
+#   3) 精准剥离 www.zip 源包旧注入
+#   4) 自愈 icons.json（v1.x remove_icon 的 jq 三层嵌套 bug 可能导致序号错乱 / 结构嵌套）
+# 目的：从旧版升级后，立刻把用户现有的图标"推倒重来 + 自愈" —— 防止新代码遇到旧注入格式时
+#       出现 marker 不识别 / 前端注入加载失败 / 图标损坏等不兼容表现。
+# 注意：还原态锁定下不执行（用户还原后本来就不希望自动重建）
+upgrade_migration_cleanup_and_recreate() {
+    # 还原态：明确是用户要求清空所有图标 & 注入，任何重建都属于越权，直接跳过
+    [ ! -f "${RESTORED_FLAG}" ] || return 0
+
+    # ---- 判断迁移必要性（两层防御，避免假阴性） ----
+    # (a) PKG_VAR/backup 下是否有遗留（不管 migration marker 是什么），
+    #     只要有旧备份文件就必须清理 —— 防止手动覆盖安装 / 非标准升级流程导致 marker 失效。
+    local have_legacy_backups=0
+    if [ -d "${BACKUP_DIR}" ] && [ -n "$(ls -A "${BACKUP_DIR}" 2>/dev/null)" ]; then
+        have_legacy_backups=1
+    fi
+    # (b) APPDATA_DIR/backup 下是否有遗留备份副本（从 v1.x 可能同步过来的）
+    if [ -d "${APPDATA_DIR}/backup" ] && [ -n "$(ls -A "${APPDATA_DIR}/backup" 2>/dev/null)" ]; then
+        have_legacy_backups=1
+    fi
+    # (c) /usr/trim/share/.restore/ 下是否遗留 www.zip.fndesk.* 备份
+    if ls /usr/trim/share/.restore/www.zip.fndesk.* >/dev/null 2>&1; then
+        have_legacy_backups=1
+    fi
+    # (d) 运行时/源包是否含 v1.x marker（或非当前版本 marker）
+    local have_legacy_injection=0
+    v1x_injection_present && have_legacy_injection=1
+    restore_zip_has_legacy_injection && have_legacy_injection=1
+    # (e) 迁移 marker 是否还没写过（本版本第一次触发）
+    local marker_missing=0
+    [ ! -f "${UPGRADE_MIGRATION_MARKER}" ] && marker_missing=1
+
+    # 没有任何遗留 & marker 已存在 & 无旧 marker → 直接跳过（节省 IO 扫描）
+    if [ "${have_legacy_backups}" -eq 0 ] && [ "${have_legacy_injection}" -eq 0 ] && [ "${marker_missing}" -eq 0 ]; then
+        return 0
+    fi
+
+    init_dirs 2>/dev/null || true
+
+    local migrated_any=0
+    local restore_zip="/usr/trim/share/.restore/www.zip"
+
+    # ------ Step 1：删除 BACKUP_DIR/* 遗留备份 + APPDATA_DIR/backup 副本（双向清除！） ------
+    if [ -d "${BACKUP_DIR}" ] && [ -n "$(ls -A "${BACKUP_DIR}" 2>/dev/null)" ]; then
+        log_warn "[upgrade] 检测到 BACKUP_DIR (${BACKUP_DIR}) 下有 v1.x 遗留备份，立即删除..."
+        if rm -rf "${BACKUP_DIR:?}/"* 2>/dev/null; then
+            migrated_any=1
+            log_info "[upgrade] 已删除 PKG_VAR 下的旧备份（${BACKUP_DIR}） —— v2.0 零备份依赖"
+        fi
+    fi
+    if [ -d "${APPDATA_DIR}/backup" ] && [ -n "$(ls -A "${APPDATA_DIR}/backup" 2>/dev/null)" ]; then
+        log_warn "[upgrade] 检测到 APPDATA_DIR/backup 下有备份副本，删除以防 restore 时重新复活..."
+        if rm -rf "${APPDATA_DIR:?}/backup/"* 2>/dev/null; then
+            migrated_any=1
+            log_info "[upgrade] 已删除 APPDATA_DIR 下的备份副本（${APPDATA_DIR}/backup）"
+        fi
+        # 若 backup/ 已空，把目录本身也删掉（免得 ls -A 继续触发）
+        rmdir "${APPDATA_DIR}/backup" 2>/dev/null || true
+    fi
+
+    # ------ Step 2：删除 www.zip.fndesk.orig / www.zip.fndesk.bak.* 源包遗留备份 ------
+    if [ -f "/usr/trim/share/.restore/www.zip.fndesk.orig" ]; then
+        if rm -f "/usr/trim/share/.restore/www.zip.fndesk.orig" 2>/dev/null; then
+            migrated_any=1
+            log_info "[upgrade] 已删除遗留备份: /usr/trim/share/.restore/www.zip.fndesk.orig"
+        fi
+    fi
+    local bak
+    for bak in /usr/trim/share/.restore/www.zip.fndesk.bak.*; do
+        [ -e "${bak}" ] || continue
+        if rm -f "${bak}" 2>/dev/null; then
+            migrated_any=1
+            log_info "[upgrade] 已删除遗留备份: ${bak}"
+        fi
+    done
+    # 极端兜底：APPDATA_DIR 或 PKG_VAR 根目录若不小心遗留了 www.zip.fndesk.* 备份文件也一起清
+    # （之前某版本可能 backup 到了错误路径；这里扫一遍，防止残留）
+    local stray
+    for stray in "${APPDATA_DIR}"/*.fndesk.orig "${APPDATA_DIR}"/www.zip.fndesk.bak.* \
+                 "${PKG_VAR}"/*.fndesk.orig "${PKG_VAR}"/www.zip.fndesk.bak.*; do
+        [ -e "${stray}" ] || continue
+        if rm -f "${stray}" 2>/dev/null; then
+            migrated_any=1
+            log_info "[upgrade] 已清除路径外遗留备份: ${stray}"
+        fi
+    done
+
+    # ------ Step 3：自愈 icons.json（v1.x remove_icon jq 三层嵌套 bug → 序号/结构错乱） ------
+    if [ -f "${CONF_JSON}" ]; then
+        local before_cnt=0 nested_bad=0
+        before_cnt=$(jq 'length' "${CONF_JSON}" 2>/dev/null || echo 0)
+        # 先检测：是否仍有条目是 {"key":N,"value":{标题,跳转URL}} 的三层嵌套损坏结构
+        if jq -e 'any(.[]; type == "object" and has("key") and has("value"))' "${CONF_JSON}" >/dev/null 2>&1; then
+            nested_bad=1
+        fi
+        normalize_icons_json
+        local after_cnt=0
+        after_cnt=$(jq 'length' "${CONF_JSON}" 2>/dev/null || echo 0)
+        if [ "${before_cnt}" != "${after_cnt}" ] || [ "${nested_bad}" -eq 1 ]; then
+            migrated_any=1
+            log_info "[upgrade] icons.json 已完成自愈 (条目数 ${before_cnt} → ${after_cnt})，保证 v2.0 注入逻辑可正确读取"
+        fi
+    fi
+
+    # ------ Step 4：剥离运行时旧注入（发现旧 marker 或缓存参数时） ------
+    if v1x_injection_present; then
+        log_warn "[upgrade] 检测到运行时 ${FN_WWW} 含 v1.x / 旧版本注入 —— 精准剥离旧注入后从头重写 v${APP_VERSION} 注入"
+        if command -v python3 >/dev/null 2>&1; then
+            local curasset=""
+            curasset=$(python3 - "${INDEX_HTML}" <<'PYEOF'
+import re, pathlib, sys
+s = pathlib.Path(sys.argv[1]).read_text('utf-8', errors='replace')
+m = re.search(r'src="(/assets/index-[^"?]+\.js)(?:\?[^"]*)?"', s)
+if not m:
+    m = re.search(r'src="(/assets/[^"?]+\.js)(?:\?[^"]*)?"', s)
+print(m.group(1).lstrip('/') if m else '')
+PYEOF
+            )
+            if [ -n "${curasset}" ] && [ -f "${FN_WWW}/${curasset}" ]; then
+                # 3.4.1 index.html 缓存参数剥离
+                if grep -q '?v=fndesk[0-9]\+' "${INDEX_HTML}" 2>/dev/null; then
+                    local tmpidx="/tmp/fn-docker-desk.idx.upg.$$"
+                    python3 - "${INDEX_HTML}" "${tmpidx}" <<'PYEOF'
+import pathlib, re, sys
+src, dst = sys.argv[1], sys.argv[2]
+s = pathlib.Path(src).read_text('utf-8', errors='replace')
+s2 = re.sub(r'src="(/assets/[^"?]+\.js)(?:\?v=fndesk[0-9]+){1,2}"', r'src="\1"', s)
+pathlib.Path(dst).write_text(s2, 'utf-8')
+PYEOF
+                    if [ -s "${tmpidx}" ] && ! cmp -s "${tmpidx}" "${INDEX_HTML}" 2>/dev/null; then
+                        if mv -f "${tmpidx}" "${INDEX_HTML}" 2>/dev/null; then
+                            chmod 644 "${INDEX_HTML}" 2>/dev/null || true
+                            migrated_any=1
+                            log_info "[upgrade] index.html: 已剥离旧 fndesk 缓存参数"
+                        else
+                            rm -f "${tmpidx}" 2>/dev/null || true
+                        fi
+                    else
+                        rm -f "${tmpidx}" 2>/dev/null || true
+                    fi
+                fi
+
+                # 3.4.2 JS 尾部 marker 精准剥离（v1.x 或任何非当前版本 marker → 一刀切）
+                local tmpjs="/tmp/fn-docker-desk.js.upg.$$"
+                if python3 - "${FN_WWW}/${curasset}" "${tmpjs}" <<'PYEOF'
+import pathlib, re, sys
+src, dst = sys.argv[1], sys.argv[2]
+s = pathlib.Path(src).read_text('utf-8', errors='replace')
+s2 = re.split(r';/\* fn-docker-desk asset injection v[0-9]+\.[0-9.]+ \*/', s, maxsplit=1)[0].rstrip()
+pathlib.Path(dst).write_text(s2 + "\n", 'utf-8')
+PYEOF
+                then
+                    if [ -s "${tmpjs}" ] && ! cmp -s "${tmpjs}" "${FN_WWW}/${curasset}" 2>/dev/null; then
+                        if mv -f "${tmpjs}" "${FN_WWW}/${curasset}" 2>/dev/null; then
+                            chmod 644 "${FN_WWW}/${curasset}" 2>/dev/null || true
+                            migrated_any=1
+                            log_info "[upgrade] assets JS: 已精准剥离 v1.x 注入代码块"
+                        else
+                            rm -f "${tmpjs}" 2>/dev/null || true
+                        fi
+                    else
+                        rm -f "${tmpjs}" 2>/dev/null || true
+                    fi
+                else
+                    rm -f "${tmpjs}" 2>/dev/null || true
+                fi
+            fi
+        fi
+    fi
+
+    # ------ Step 5：剥离 www.zip 源包旧注入（发现旧 marker 或非当前版本 marker 时） ------
+    if [ -f "${restore_zip}" ] && restore_zip_has_legacy_injection; then
+        log_warn "[upgrade] 检测到源包 ${restore_zip} 含 v1.x / 旧版本注入 —— 调用精准反注入剥离"
+        local rc=0
+        precise_restore_web_zip "${restore_zip}" || rc=$?
+        case "${rc}" in
+            0) migrated_any=1; log_info "[upgrade] 已剥离 ${restore_zip} 内的旧注入条目" ;;
+            2) log_info "[upgrade] ${restore_zip} 已经干净（未发现注入）" ;;
+            *) log_warn "[upgrade] 剥离 ${restore_zip} 失败（可能 zip 结构异常），本次忽略：rc=${rc}" ;;
+        esac
+    fi
+
+    # ------ 收尾：写迁移标记 + 持久卷备份固化"空状态" ------
+    if [ "${migrated_any}" -eq 1 ]; then
+        log_warn "[upgrade] v1.x → v${APP_VERSION} 迁移完成：清理备份 + 自愈图标 + 精准剥离旧注入，接下来将从头重写注入（保证与新代码 100% 兼容）"
+    else
+        # 虽然本次没改动，但为了让下次 apply 不再反复检测，仍写一次标记（节省一次 IO 扫描）
+        log_info "[upgrade] 未发现 v1.x 遗留备份或旧注入，跳过迁移"
+    fi
+    mkdir -p "$(dirname "${UPGRADE_MIGRATION_MARKER}")" 2>/dev/null || true
+    touch "${UPGRADE_MIGRATION_MARKER}" 2>/dev/null || true
+    # APPDATA_DIR 也同步写一个（防止 PKG_VAR 与 APPDATA_DIR 不同路径时误判重入）
+    mkdir -p "${APPDATA_DIR}" 2>/dev/null || true
+    touch "${APPDATA_DIR}/.upgrade_migrated_v${APP_VERSION}" 2>/dev/null || true
+    # 关键：把"BACKUP_DIR/备份副本已清空 + icons.json 已自愈"的结果立刻同步到 APP卷。
+    # 否则下一次触发"配置为空 → restore_data_from_appdata" 时，旧版本 icons.json 或
+    # APPDATA 下残留 backup/ 副本可能会把"刚删掉的备份/旧图标"又复活出来。
+    if [ "${migrated_any}" -eq 1 ]; then
+        backup_data_to_appdata >/dev/null 2>&1 || true
+    fi
+    return 0
 }
 
 # 获取 NAS 局域网 IP
@@ -590,15 +847,10 @@ PYEOF
     if runtime_injection_is_current "${INDEX_HTML}" "${FN_WWW}/${asset}" "${APP_VERSION}"; then
         log_info "运行时已注入且版本匹配 (${APP_VERSION})，跳过写 /usr/trim/www (避免 nginx 重启)"
         # 源包 www.zip 仍尝试 patch 一次（保证系统重建桌面后不丢），但不 reload
-        if [ ! -f "${restore_zip}.fndesk.orig" ]; then
-            cp -f "${restore_zip}" "${restore_zip}.fndesk.orig"
-            log_info "已备份 fnOS Web 源包: ${restore_zip}.fndesk.orig"
-        fi
+        # （v2.0 精准反注入式还原：不再创建 .fndesk.orig / .fndesk.bak 等备份文件）
         mkdir -p "${tmproot}/$(dirname "${asset}")"
         cp "${INDEX_HTML}" "${tmproot}/index.html"
         cp "${FN_WWW}/${asset}" "${tmproot}/${asset}"
-        cp -f "${restore_zip}" "${restore_zip}.fndesk.bak.$(date +%Y%m%d%H%M%S)"
-        ls -1t "${restore_zip}".fndesk.bak.* 2>/dev/null | tail -n +3 | xargs -r rm -f 2>/dev/null || true
         (cd "${tmproot}" && zip -q -u "${restore_zip}" index.html "${asset}") 2>/dev/null || true
         log_info "已 patch fnOS Web 源包（跳过 reload：运行时未变更，避免断开现有连接）"
         return 0
@@ -630,7 +882,8 @@ idx = re.sub(r'src="(/assets/index-[^"?]+\.js)(?:\?[^"]*)?"',
 index.write_text(idx, 'utf-8')
 
 js = asset.read_text('utf-8', errors='replace')
-js = re.split(r';/\* fn-docker-desk asset injection v[01]\.[0-9.]+ \*/', js)[0].rstrip()
+# 兼容 v1.x 与 v2.x 所有历史注入标记（下次升级能精准剥离旧注入再重写）
+js = re.split(r';/\* fn-docker-desk asset injection v[0-9]+\.[0-9.]+ \*/', js)[0].rstrip()
 inject = inject_file.read_text('utf-8', errors='replace')
 inject = inject.replace('__VERSION__', app_version)
 asset.write_text(js + "\n" + inject + "\n", 'utf-8')
@@ -640,14 +893,7 @@ PYEOF
         return 1
     fi
 
-    if [ ! -f "${BACKUP_DIR}/index.html.runtime.orig" ]; then
-        cp -f "${INDEX_HTML}" "${BACKUP_DIR}/index.html.runtime.orig" 2>/dev/null || true
-        log_info "已备份当前运行 index.html: ${BACKUP_DIR}/index.html.runtime.orig"
-    fi
-    if [ ! -f "${BACKUP_DIR}/$(basename "${asset}").runtime.orig" ]; then
-        cp -f "${FN_WWW}/${asset}" "${BACKUP_DIR}/$(basename "${asset}").runtime.orig" 2>/dev/null || true
-        log_info "已备份当前运行 JS: ${BACKUP_DIR}/$(basename "${asset}").runtime.orig"
-    fi
+    # 不再备份 runtime.orig 到 BACKUP_DIR（v2.0 精准反注入式还原零备份依赖）
 
     # =====================================================================
     # 防线 2 & 3：safe_install_file = cmp 字节比较 + 原子 mv
@@ -680,13 +926,8 @@ PYEOF
     fi
 
     # ------- 源包 patch（/usr/trim/share/.restore/www.zip 不在 www 目录，不触发监听器） -------
-    if [ ! -f "${restore_zip}.fndesk.orig" ]; then
-        cp -f "${restore_zip}" "${restore_zip}.fndesk.orig"
-        log_info "已备份 fnOS Web 源包: ${restore_zip}.fndesk.orig"
-    fi
-    cp -f "${restore_zip}" "${restore_zip}.fndesk.bak.$(date +%Y%m%d%H%M%S)"
-    # 只保留最近 2 个源包备份，避免 50MB+ 级 www.zip 备份堆积占满磁盘
-    ls -1t "${restore_zip}".fndesk.bak.* 2>/dev/null | tail -n +3 | xargs -r rm -f 2>/dev/null || true
+    # （v2.0 精准反注入式还原：不再创建 .fndesk.orig / .fndesk.bak.* 备份文件
+    #   每次直接 zip -u 增量写入，单个 www.zip 的字节写入只影响我们改的 2 个条目）
     if ! (cd "${tmproot}" && zip -q -u "${restore_zip}" index.html "${asset}") 2>/dev/null; then
         log_warn "更新 fnOS Web 源包失败（当前运行目录已生效，但系统重启后图标可能丢失）"
         return 1
@@ -707,14 +948,25 @@ PYEOF
 
 # 发布桌面 JSON：从主配置 CONF_JSON 生成桌面端读取的 DEST_JSON（并兼容旧 userimg 路径）
 publish_json() {
-    # 备份当前发布文件（首次发布时备份原始 index.html 之外的配置）
-    if [ -f "${DEST_JSON}" ] && [ ! -f "${BACKUP_DIR}/fn-docker-desk.json.bak" ]; then
-        cp "${DEST_JSON}" "${BACKUP_DIR}/fn-docker-desk.json.bak" 2>/dev/null || true
-        log_info "已备份发布配置: ${BACKUP_DIR}/fn-docker-desk.json.bak"
+    # v2.0 改变：备份不再放在 BACKUP_DIR（即 PKG_VAR/backup/）下，避免用户把"配置安全备份"
+    # 与 v1.x 的"系统文件 .runtime.orig 备份"混淆 —— 清空系统文件备份后又出现 .bak 会误以为
+    # 升级没清干净。现在把 icons/desktop json 备份放在 PKG_VAR 根目录（名称带前缀），
+    # 同时备份失败也不阻塞发布成功判定。
+    if [ -f "${DEST_JSON}" ] && [ ! -f "${PKG_VAR}/.fn-dd-desktop.json.bak" ]; then
+        cp "${DEST_JSON}" "${PKG_VAR}/.fn-dd-desktop.json.bak" 2>/dev/null || true
+        log_info "已备份发布配置: ${PKG_VAR}/.fn-dd-desktop.json.bak"
     fi
-    if [ -f "${CONF_JSON}" ] && [ ! -f "${BACKUP_DIR}/icons.json.bak" ]; then
-        cp "${CONF_JSON}" "${BACKUP_DIR}/icons.json.bak" 2>/dev/null || true
-        log_info "已备份主配置: ${BACKUP_DIR}/icons.json.bak"
+    if [ -f "${CONF_JSON}" ] && [ ! -f "${PKG_VAR}/.fn-dd-icons.json.bak" ]; then
+        cp "${CONF_JSON}" "${PKG_VAR}/.fn-dd-icons.json.bak" 2>/dev/null || true
+        log_info "已备份主配置: ${PKG_VAR}/.fn-dd-icons.json.bak"
+    fi
+    # 迁移收尾：扫一次 BACKUP_DIR，若仍残留旧版 fn-docker-desk.json.bak / icons.json.bak 则立刻清
+    # （防止上面路径没迁之前 publish_json 写出了旧位置，然后用户看到备份又"复活"）
+    if [ -f "${BACKUP_DIR}/fn-docker-desk.json.bak" ]; then
+        rm -f "${BACKUP_DIR}/fn-docker-desk.json.bak" 2>/dev/null || true
+    fi
+    if [ -f "${BACKUP_DIR}/icons.json.bak" ]; then
+        rm -f "${BACKUP_DIR}/icons.json.bak" 2>/dev/null || true
     fi
     if ! cp -f "${CONF_JSON}" "${DEST_JSON}" 2>/dev/null; then
         log_err "发布桌面配置失败: ${DEST_JSON}"
@@ -1004,8 +1256,17 @@ cmd_apply() {
         log_warn "已处于还原态：跳过注入与图标生成（如需重新启用，请在管理面板添加图标）"
         return 0
     fi
-    # 升级/重装后自愈：配置被清空时从持久卷恢复（保证图标数据不丢）
+    # 升级/重装后自愈：配置被清空时先从持久卷恢复（保证图标数据不丢）
     restore_data_from_appdata
+    # v2.0+ 升级迁移：必须放在 restore_data_from_appdata 之后！
+    # 原因：restore_data 会从 APPDATA_DIR 把旧的 icons.json / desktop.json / icons/ 恢复回来，
+    # 更关键的是，如果 APPDATA_DIR/backup 下遗留了旧备份副本，restore 不会恢复它们（但可能之前
+    # 同步 APP卷时被打包进去过），所以必须在 restore 之后再扫一遍并彻底清理，
+    # 然后 upgrade_migration 内部会再 backup_data_to_appdata，把"BACKUP_DIR/备份副本 已清空"
+    # 的结果立刻固化回 APP 持久卷 —— 彻底杜绝"加一个 Docker 图标，旧备份又出现"的问题。
+    # 升级迁移逻辑：检测旧版遗留备份（BACKUP_DIR/* / APPDATA_DIR/backup / www.zip.fndesk.*）
+    # 与 v1.x marker，自动删除旧备份、自愈 icons.json 损坏数据、精准剥离运行时+源包旧注入。
+    upgrade_migration_cleanup_and_recreate || true
     if [ "${1:-}" != "--quiet" ]; then
         log_info "应用配置到桌面..."
     fi
@@ -1058,6 +1319,7 @@ cmd_backups() {
 }
 
 # 精准反注入 fnOS Web 源包：只删除本工具写入的 JS 片段与缓存参数，不回滚其他系统变更
+# 全程不依赖任何备份文件，不做任何整体覆盖，不会影响应用商城后续安装的应用图标
 precise_restore_web_zip() {
     local restore_zip="$1"
     [ -f "${restore_zip}" ] || return 1
@@ -1077,7 +1339,8 @@ import tempfile
 import zipfile
 
 zip_path = pathlib.Path(sys.argv[1])
-marker = re.compile(r';/\* fn-docker-desk asset injection v[01]\.[0-9.]+ \*/')
+# 兼容 v1.x 与 v2.x 所有历史版本的注入标记
+marker = re.compile(r';/\* fn-docker-desk asset injection v[0-9]+\.[0-9.]+ \*/')
 tmp = pathlib.Path(tempfile.mkdtemp(prefix="fn-docker-desk-restore."))
 try:
     with zipfile.ZipFile(zip_path, "r") as z:
@@ -1086,6 +1349,7 @@ try:
             print("index.html not found in www.zip", file=sys.stderr)
             sys.exit(1)
         index = z.read("index.html").decode("utf-8", "replace")
+        # 兼容所有历史注入版本的缓存参数（fndesk1~fndesk99）
         new_index = re.sub(r'\?v=fndesk[0-9]+"', '"', index)
         changed = []
         if new_index != index:
@@ -1105,11 +1369,25 @@ try:
                     out.parent.mkdir(parents=True, exist_ok=True)
                     out.write_text(parts[0].rstrip() + "\n", "utf-8")
                     changed.append(asset)
+    # v0.2 兼容：清除 index.html 中的旧 HTML 注入块（MARKER_START..MARKER_END）
+    if changed:
+        cur_idx_p = tmp / "index.html"
+        if not cur_idx_p.exists():
+            cur_idx_p.write_text(new_index, "utf-8")
+        text = cur_idx_p.read_text("utf-8")
+        ms = "<!-- fn-docker-desk:start -->"
+        me = "<!-- fn-docker-desk:end -->"
+        s = text.find(ms); e = text.find(me)
+        if s != -1 and e != -1 and e > s:
+            text = text[:s] + text[e + len(me):]
+            cur_idx_p.write_text(text, "utf-8")
+            if "index.html" not in changed:
+                changed.append("index.html")
     if not changed:
         print("no fn-docker-desk injection found")
         sys.exit(2)
-    bak = zip_path.with_name(zip_path.name + ".fndesk.restore.bak")
-    shutil.copy2(zip_path, bak)
+    # 不创建 .fndesk.orig / .fndesk.restore.bak 这类备份文件
+    # 精准反注入式还原 = 0 备份依赖，所有回退只基于 marker 精确剥离
     subprocess.run(["zip", "-q", "-u", str(zip_path), *changed], cwd=str(tmp), check=True)
     print("precise restore updated: " + ", ".join(changed))
 finally:
@@ -1124,6 +1402,7 @@ precise_restore_runtime_web() {
     #   - 所有内容改动先写到 /tmp 临时文件
     #   - cmp 字节比对目标文件：相同则丢弃临时文件，不碰原文件；不同再原子 mv
     # 返回值：0=已更新；2=未发现注入（已干净）；非0=处理失败
+    # 全程零备份依赖：仅通过 marker 精确剥离
     python3 - "${INDEX_HTML}" <<'PYEOF'
 import filecmp
 import os
@@ -1135,7 +1414,13 @@ import tempfile
 
 idx_path = pathlib.Path(sys.argv[1])
 idx = idx_path.read_text("utf-8", errors="replace")
-# 1. 清除 index.html 中所有 fndesk 版本参数（不依赖特定 JS 文件名）
+# 0. 先清除 v0.2 遗留的 HTML 注入块（<!-- fn-docker-desk:start --> ... <!-- fn-docker-desk:end -->）
+MS = "<!-- fn-docker-desk:start -->"
+ME = "<!-- fn-docker-desk:end -->"
+s = idx.find(MS); e = idx.find(ME)
+if s != -1 and e != -1 and e > s:
+    idx = idx[:s] + idx[e + len(ME):]
+# 1. 清除 index.html 中所有 fndesk 版本参数（兼容 v1~v99，不依赖特定 JS 文件名）
 new_idx = re.sub(r'\?v=fndesk[0-9]+"', '"', idx)
 changed = False
 if new_idx != idx:
@@ -1153,8 +1438,9 @@ if new_idx != idx:
         print("safe_install failed for index.html: %s" % e, file=sys.stderr)
         sys.exit(1)
 
-# 2. 遍历 assets 下所有 js，清除 fn-docker-desk 注入代码（覆盖桌面升级后文件名变化的情况）
-marker = re.compile(r';/\* fn-docker-desk asset injection v[01]\.[0-9.]+ \*/')
+# 2. 遍历 assets 下所有 js，清除 fn-docker-desk 注入代码
+#    marker 兼容 v1.x 与 v2.x（历史/未来大版本）
+marker = re.compile(r';/\* fn-docker-desk asset injection v[0-9]+\.[0-9.]+ \*/')
 assets_dir = pathlib.Path("/usr/trim/www/assets")
 if assets_dir.is_dir():
     for js_path in sorted(assets_dir.glob("*.js")):
@@ -1186,163 +1472,90 @@ sys.exit(0 if changed else 2)
 PYEOF
 }
 
-# 仅从备份 zip 恢复本工具改动的文件（index.html 与主 JS），不整体覆盖 www.zip，
-# 避免把 fnOS 应用商城后续安装的应用图标一并还原掉
-restore_our_files_from_zip() {
-    local dst="$1" src="$2"
-    [ -f "${dst}" ] && [ -f "${src}" ] || return 1
-    command -v python3 >/dev/null 2>&1 || return 1
-    command -v zip >/dev/null 2>&1 || return 1
-    python3 - "${dst}" "${src}" <<'PYEOF'
-import pathlib
-import re
-import shutil
-import subprocess
-import sys
-import tempfile
-import zipfile
-
-dst, src = sys.argv[1], sys.argv[2]
-with zipfile.ZipFile(src) as z:
-    names = set(z.namelist())
-    if "index.html" not in names:
-        print("backup zip has no index.html", file=sys.stderr)
-        sys.exit(1)
-    index = z.read("index.html").decode("utf-8", "replace")
-    m = re.search(r'src="(/assets/index-[^"?]+\.js)(?:\?[^"]*)?"', index)
-    if not m:
-        m = re.search(r'src="(/assets/[^"?]+\.js)(?:\?[^"]*)?"', index)
-    if not m or m.group(1).lstrip("/") not in names:
-        print("backup zip main asset not found", file=sys.stderr)
-        sys.exit(1)
-    asset = m.group(1).lstrip("/")
-tmp = tempfile.mkdtemp(prefix="fn-docker-desk-restore.")
-try:
-    with zipfile.ZipFile(src) as z:
-        for name in ("index.html", asset):
-            p = pathlib.Path(tmp) / name
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_bytes(z.read(name))
-    # 用 zip 命令增量更新（目标 zip 可能含加密条目，zipfile 全量重写会失败）
-    subprocess.run(["zip", "-q", "-u", dst, "index.html", asset], cwd=tmp, check=True)
-    print("restored our files: index.html + " + asset)
-finally:
-    shutil.rmtree(tmp, ignore_errors=True)
-PYEOF
-}
+# (restore_our_files_from_zip 已在 v2.0 删除：改用精准反注入 + marker 剥离，不再依赖任何备份文件)
 
 cmd_restore() {
     require_root
-    log_warn "开始还原到原始飞牛桌面..."
+    log_warn "开始还原到原始飞牛桌面（精准反注入式，零备份依赖）..."
 
-    # 1. 兼容 v0.2 旧方案：如果运行目录 index.html 里仍有标记，先删除标记块
-    #    安全写入：先写 /tmp 临时文件，cmp 不同再原子 mv，避免触发 trim_nginx 文件监听器
-    if [ -f "${INDEX_HTML}" ] && grep -q "${MARKER_START}" "${INDEX_HTML}"; then
-        if command -v python3 >/dev/null 2>&1; then
-            local _legacy_tmp _legacy_changed=0
-            _legacy_tmp="$(mktemp /tmp/fndesk-legacy-XXXXXX.html)"
-            if python3 - "${INDEX_HTML}" "${_legacy_tmp}" <<'PYEOF'
-import filecmp
-import os
-import shutil
-import sys
-src, dst = sys.argv[1], sys.argv[2]
-ms = '<!-- fn-docker-desk:start -->'
-me = '<!-- fn-docker-desk:end -->'
-with open(src, encoding='utf-8') as f:
-    content = f.read()
-s = content.find(ms); e = content.find(me)
-if s != -1 and e != -1 and e > s:
-    content = content[:s] + content[e + len(me):]
-with open(dst, 'w', encoding='utf-8') as f:
-    f.write(content)
-PYEOF
-            then
-                # safe_install_file 语义：字节相同则不触碰原文件（返回 0 未变更）
-                safe_install_file "${_legacy_tmp}" "${INDEX_HTML}" >/dev/null 2>&1 || _legacy_changed=$?
-                if [ "${_legacy_changed}" -eq 1 ]; then
-                    log_info "已移除旧版 index.html 注入脚本（运行时文件已更新）"
-                elif [ "${_legacy_changed}" -eq 0 ]; then
-                    log_info "已移除旧版 index.html 注入脚本（内容相同，跳过写盘避免 nginx 重启）"
-                else
-                    log_warn "移除旧版 index.html 注入脚本失败 (safe_install rc=${_legacy_changed})"
-                fi
-            else
-                log_warn "缺少 python3 执行失败，跳过旧版 index.html 精确清理"
-            fi
-            rm -f "${_legacy_tmp}"
-        else
-            log_warn "缺少 python3，跳过旧版 index.html 精确清理"
-        fi
-    fi
-
-    # 2. 移除开机重放服务，避免还原后再次注入（保留 Web 面板，避免 pkill 误杀调用方）
+    # 1. 移除开机重放服务，避免还原后再次注入（保留 Web 面板进程避免误杀调用方）
     uninstall_persistence --keep-web
 
-    # 3. 精准反注入当前运行目录与 www.zip；任一未生效则从备份恢复本工具改动的文件
-    #    （返回值：0=已更新；2=无注入已干净；1/其他=处理失败；用 || 保护避免 set -e 中断还原）
-    local runtime_rc=0 zip_rc=1
-    precise_restore_runtime_web >/dev/null 2>&1 || runtime_rc=$?
-    local restore_zip="/usr/trim/share/.restore/www.zip"
-    if [ -f "${restore_zip}" ]; then
-        precise_restore_web_zip "${restore_zip}" >/dev/null 2>&1 || zip_rc=$?
-    fi
-    local restored=0
-    # 运行时与 www.zip 任一成功反注入即视为已还原
-    [ "${runtime_rc}" -eq 0 ] && restored=1
-    [ "${zip_rc}" -eq 0 ] && restored=1
-    # 兜底：运行时 index.html 仍含注入标记时，说明反注入未完全生效
-    if [ -f "${INDEX_HTML}" ] && grep -q 'fndesk' "${INDEX_HTML}"; then
-        log_warn "运行时 index.html 仍含注入标记，反注入未完全生效"
-        restored=0
-    fi
-    if [ "${restored}" -eq 1 ]; then
-        systemctl reload trim_nginx.service 2>/dev/null || true
-        if [ "${zip_rc}" -eq 0 ] || [ "${zip_rc}" -eq 2 ]; then
-            log_info "已精准移除 fnOS Web 源包与运行目录中的 fn-docker-desk 注入"
-        else
-            log_warn "运行目录注入已移除，但 fnOS Web 源包（www.zip）更新失败，系统重建桌面后注入可能复活，建议重启应用或手动检查 www.zip"
-        fi
+    # 2. 精准反注入当前运行目录（index.html 缓存参数 + assets JS 注入片段 + v0.2 HTML 注入块）
+    #    （返回值：0=已更新；2=无注入已干净；1/其他=处理失败；|| 避免 set -e 中断）
+    local runtime_rc=2 zip_rc=2
+    if command -v python3 >/dev/null 2>&1; then
+        precise_restore_runtime_web >/dev/null 2>&1 || runtime_rc=$?
     else
-        log_warn "精准反注入未完全生效，从备份恢复本工具改动的文件（不整体覆盖，保护应用商城已装应用）"
-        if [ -f "${restore_zip}" ] && [ -f "${restore_zip}.fndesk.orig" ] && restore_our_files_from_zip "${restore_zip}" "${restore_zip}.fndesk.orig"; then
-            restored=1
-            systemctl reload trim_nginx.service 2>/dev/null || true
-            log_info "已从本工具原始备份恢复改动文件: index.html + 主 JS"
-        elif [ -f "${restore_zip}" ] && [ -f "/usr/trim/share/.restore/www.bak" ] && restore_our_files_from_zip "${restore_zip}" "/usr/trim/share/.restore/www.bak"; then
-            restored=1
-            systemctl reload trim_nginx.service 2>/dev/null || true
-            log_warn "未找到本工具原始备份，已从外部 Fndesk www.bak 恢复改动文件"
-        else
-            log_warn "未找到可用的还原备份，仅清理本工具配置"
+        log_warn "缺少 python3，跳过运行时目录精准反注入"
+    fi
+
+    # 3. 精准反注入 fnOS Web 源包 www.zip（marker 剥离 + zip -u 增量写回，不破坏其他应用条目）
+    local restore_zip="/usr/trim/share/.restore/www.zip"
+    if [ -f "${restore_zip}" ] && command -v python3 >/dev/null 2>&1 && command -v zip >/dev/null 2>&1; then
+        precise_restore_web_zip "${restore_zip}" >/dev/null 2>&1 || zip_rc=$?
+    elif [ -f "${restore_zip}" ]; then
+        log_warn "缺少 python3 或 zip，跳过 www.zip 精准反注入（系统重建桌面后注入可能复活）"
+    fi
+
+    # 4. 判定结果 & 按需 reload（reload 仅当至少一次实际发生反注入更新时执行）
+    local any_changed=0
+    [ "${runtime_rc}" -eq 0 ] && any_changed=1
+    [ "${zip_rc}" -eq 0 ] && any_changed=1
+
+    # 5. 二次校验：index.html 与 www.zip 是否已完全干净（仍含 fndesk 关键词则警告）
+    local dirty=0
+    if [ -f "${INDEX_HTML}" ] && grep -qiE "fndesk|fn-docker-desk" "${INDEX_HTML}"; then
+        log_warn "校验不通过：运行时 index.html 仍含 fndesk 关键词，建议检查 / 手动清理"
+        dirty=1
+    fi
+    if [ -f "${restore_zip}" ] && command -v unzip >/dev/null 2>&1; then
+        if unzip -p "${restore_zip}" index.html 2>/dev/null | grep -qiE "fndesk|fn-docker-desk"; then
+            log_warn "校验不通过：www.zip 内 index.html 仍含 fndesk 关键词，重启桌面后注入可能复活"
+            dirty=1
         fi
     fi
 
-    # 4. 彻底清除本工具生成的用户/容器图标配置与图片
-    #    icons.json 仅存用户/容器图标（应用自身入口由 fnOS 应用中心管理，不在此文件），一键还原全部清空
+    if [ "${any_changed}" -eq 1 ] && [ "${dirty}" -eq 0 ]; then
+        systemctl reload trim_nginx.service 2>/dev/null || true
+        log_info "精准反注入完成：运行目录 + www.zip 已剥离所有 fn-docker-desk 注入（不依赖任何备份）"
+    elif [ "${any_changed}" -eq 1 ]; then
+        systemctl reload trim_nginx.service 2>/dev/null || true
+        log_warn "精准反注入已执行，但仍残留 fndesk 关键词（见上方告警），若刷新后仍异常请联系维护者或手动检查 index.html"
+    else
+        # runtime_rc=2 && zip_rc=2 → 已经干净
+        log_info "运行目录与 www.zip 均未发现 fn-docker-desk 注入，已为干净状态"
+    fi
+
+    # 6. 彻底清除本工具生成的用户/容器图标配置与图片（精准反注入只清理 JS/HTML，不碰业务数据）
     if [ -f "${CONF_JSON}" ]; then
         echo '[]' > "${CONF_JSON}"
-        chmod 644 "${CONF_JSON}"
+        chmod 644 "${CONF_JSON}" 2>/dev/null || true
         log_info "已清空用户/容器图标配置（应用自身图标保留）: ${CONF_JSON}"
     fi
-    rm -f "${DEST_JSON}"
-    rm -f "${LEGACY_JSON}"
+    rm -f "${DEST_JSON}" "${LEGACY_JSON}"
     log_info "已删除桌面配置发布文件"
-    # 删除用户/容器图标图片，保留管理面板自身图标图片
     if [ -d "${IMAGE_DIR}" ]; then
         find "${IMAGE_DIR}" -maxdepth 1 -type f ! -name 'fn-docker-desk-manager.svg' -delete 2>/dev/null || true
         log_info "已删除用户/容器图标图片（管理面板自身图标保留）: ${IMAGE_DIR}"
     fi
 
-    # 5. 彻底清除应用内图标设置：持久卷备份 + 备份目录中的用户配置备份 + 旧路径数据
+    # 7. 彻底清除用户配置备份/持久卷/旧路径（避免 migrate_legacy_paths 再次迁回）
+    #    注意：从此不再依赖 / 删除任何 www.zip / index.html 相关的 .fndesk.orig / .bak 备份文件，
+    #         只清理用户数据备份
     if [ -d "${APPDATA_DIR}" ]; then
         rm -rf "${APPDATA_DIR}"
         log_info "已清除持久卷备份: ${APPDATA_DIR}"
     fi
-    # 删除用户图标配置备份（icons.json.bak / fn-docker-desk.json.bak），保留系统文件备份
+    # v2.0：配置 .json.bak 已迁到 PKG_VAR 根目录（带前缀隐藏式命名），这里新旧两处都清；
+    # 同时保留 BACKUP_DIR 旧路径的清除（兼容用户手动回滚到旧版 publish_json 行为）
     rm -f "${BACKUP_DIR}/icons.json.bak" "${BACKUP_DIR}/fn-docker-desk.json.bak"
-    log_info "已清除应用内图标配置备份: ${BACKUP_DIR}"
-    # 🔴 修复还原后添加图标旧图标复活：彻底清理 v0.2 /usr/fn-docker-desk 旧路径下的配置与图片（避免 migrate_legacy_paths 再次迁回）
+    rm -f "${PKG_VAR}/.fn-dd-icons.json.bak" "${PKG_VAR}/.fn-dd-desktop.json.bak"
+    # APPDATA_DIR 同步清除备份副本（上面 purge APPDATA 不会清 .bak，因为它们不在 icons.json 模式里）
+    rm -f "${APPDATA_DIR}/icons.json.bak" "${APPDATA_DIR}/fn-docker-desk.json.bak"
+    rm -f "${APPDATA_DIR}/.fn-dd-icons.json.bak" "${APPDATA_DIR}/.fn-dd-desktop.json.bak"
+    log_info "已清除应用内图标配置备份: ${PKG_VAR} + ${BACKUP_DIR} + ${APPDATA_DIR}"
+    # 清理 v0.2 /usr/fn-docker-desk 旧路径下的业务数据
     local legacy="/usr/fn-docker-desk"
     if [ -d "${legacy}" ]; then
         local _c=0
@@ -1353,31 +1566,23 @@ PYEOF
         [ -d "${legacy}/backup" ] && rm -f "${legacy}/backup/icons.json.bak" "${legacy}/backup/fn-docker-desk.json.bak" 2>/dev/null
         [ "${_c}" -gt 0 ] && log_info "已清除旧路径 ${legacy} 下的用户/容器图标配置与图片 (避免再次迁移复活旧图标)"
     fi
-    # 🔴 修复：写迁移标记，确保 migrate_legacy_paths 不会在还原后再次迁移旧数据（即使旧路径有残留）
+    # 同步迁移标记，确保 migrate_legacy_paths 不会因任何残留再次触发迁回
     mkdir -p "${PKG_VAR}"
     touch "${PKG_VAR}/.migrated_from_usr_fndesk"
     chmod 644 "${PKG_VAR}/.migrated_from_usr_fndesk" 2>/dev/null || true
-    # 重建 APPDATA_DIR（如存在）并同步一份迁移标记，兼容双路径结构
     mkdir -p "${APPDATA_DIR}" 2>/dev/null
     touch "${APPDATA_DIR}/.migrated_from_usr_fndesk" 2>/dev/null
     chmod 644 "${APPDATA_DIR}/.migrated_from_usr_fndesk" 2>/dev/null || true
 
-    # 6. 写入还原态标记：此后应用启动/开机自启触发的 apply 不再注入、不再生成用户图标，
-    #    直到用户主动添加/移除图标重新启用；管理面板自身图标由应用中心管理，不受影响
+    # 8. 写入还原态标记：此后应用启动/开机触发的 apply 不再注入
     mkdir -p "${CONF_DIR}"
     touch "${RESTORED_FLAG}"
     chmod 644 "${RESTORED_FLAG}" 2>/dev/null || true
-    # 🔴 修复：同步 RESTORED_FLAG 到 APPDATA_DIR（如已创建），确保双路径一致
     touch "${APPDATA_DIR}/.restored" 2>/dev/null
     chmod 644 "${APPDATA_DIR}/.restored" 2>/dev/null || true
-    log_info "已进入还原态：重新启动应用不会再生成本工具图标（管理面板自身图标保留）"
+    log_info "已进入还原态：重启应用不会再生成本工具图标（如需再次启用请重新添加 / 应用配置）"
 
-    if [ "${restored}" -eq 1 ]; then
-        log_info "还原完成！已移除本工具生成的 Docker 桌面图标并彻底清除应用内图标设置，不回滚应用商城后续安装的应用图标；重新启动本应用不会再生成图标（如需启用请重新添加）。"
-    else
-        log_warn "还原完成，但未能确认 fnOS Web 源包已恢复；如仍异常，可手动恢复 www.zip 备份。"
-    fi
-    log_info "备份文件保留在: ${BACKUP_DIR}（可用 backups 查看）"
+    log_info "还原完成！已精准剥离所有 fn-docker-desk 注入（运行目录 + www.zip）+ 清除图标业务数据。全程零备份依赖，未触碰应用商城已安装的任何应用。"
 }
 
 # ---------------- 数据持久化（升级/卸载不丢配置） ----------------

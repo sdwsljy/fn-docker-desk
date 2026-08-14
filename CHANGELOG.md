@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.0.1
+
+- **【致命】彻底修复「升级后旧备份没删干净，添加任何 Docker 图标时又再次出现」的根因** — 原来共有 3 条复活链同时发生：
+  1. **执行顺序漏洞**：`cmd_apply` 中先跑 `upgrade_migration_cleanup_and_recreate` 清 BACKUP_DIR → 后跑 `restore_data_from_appdata` 从 APP 持久卷恢复 — 等于刚删完的备份副本/脏数据又被 `restore_data` 从 `APPDATA_DIR` 原样拉回来
+  2. **迁移判定只看 marker**：只要 PKG_VAR 下 `.upgrade_migrated_v*` 已存在就直接跳过清理，手动覆盖升级/非标准流程时即便 BACKUP_DIR 仍非空也不再触发
+  3. **真正元凶：publish_json 每次发布配置都往 BACKUP_DIR/ 写两个 `.json.bak`**（`icons.json.bak` + `fn-docker-desk.json.bak`），即便 BACKUP_DIR 已经被彻底清空，用户一加图标触发 `apply → publish_json`，立刻又有 2 个备份文件出现在 BACKUP_DIR 列表里！
+- **修复分 4 条主线**：
+  1. **修复 apply 顺序**（[fn-docker-desk.sh#L1248-L1258](file:///c:/Users/Administrator/Desktop/github/fn-docker-desk/pkg/files/fn-docker-desk.sh#L1248-L1258)）：改为 `init_dirs → RESTORED_FLAG 锁定 → restore_data_from_appdata（先从持久卷拉回可能的旧副本）→ upgrade_migration_cleanup_and_recreate（立刻清掉刚拉回的脏备份）→ publish_json → apply_inject → install_persistence → backup_data_to_appdata（备份新的干净状态到 APP 卷）`，消除「先清再恢复」的时间窗漏洞
+  2. **迁移判定升级为 5 维综合判定（遗留真实存在则必清）**：新增 `have_legacy_backups = BACKUP_DIR 非空 + APPDATA_DIR/backup 非空 + /usr/trim/share/.restore/www.zip.fndesk.* 存在`、`have_legacy_injection = v1x_injection_present + restore_zip_has_legacy_injection`、`marker_missing = 还没写过本版本迁移标记` 三路 OR，**任何一路命中都必须执行清理（即便 migration marker 已写过也不短路）**
+  3. **迁移动作双向删 + 持久卷固化**：Step 1 `rm -rf BACKUP_DIR/*` **同时** `rm -rf APPDATA_DIR/backup/*`（杜绝 restore 时再次复活）；Step 2 兜底扫 APPDATA_DIR/PKG_VAR 根目录下 stray 的 `*.fndesk.orig / www.zip.fndesk.bak.*` 再清一轮；迁移末尾 **调用 `backup_data_to_appdata` 立刻把「BACKUP_DIR/备份副本已清空」的空状态同步写入 APPDATA_DIR —— 下次任何场景下 restore_data 都不可能再拉回旧备份副本**
+  4. **publish_json 备份搬家（真元凶修复）**：不再往 `BACKUP_DIR/icons.json.bak` 与 `BACKUP_DIR/fn-docker-desk.json.bak` 写文件，改为写入 PKG_VAR 根目录隐藏命名 `PKG_VAR/.fn-dd-icons.json.bak` 与 `PKG_VAR/.fn-dd-desktop.json.bak`（出现在 BACKUP_DIR 列表中的根因就是这俩文件）；同时 **publish_json 内每次发布顺手 rm BACKUP_DIR 下旧位置的两个 .bak**（兼容此前版本已经写进去的遗留物）；对应 `cmd_restore` 的清理步骤也扩展到 3 路径（BACKUP_DIR + PKG_VAR + APPDATA_DIR）共 8 个目标文件
+
+## 2.0.0
+
+- **还原逻辑重构**：从「备份依赖式还原」彻底切换为 v2.0 **精准反注入式还原**，不再依赖任何 BACKUP_DIR 备份与 `www.zip.fndesk.orig` 源包备份 — 基于 `<!-- fn-docker-desk:start/end -->` marker 精准剥离：① 运行时 index.html 的缓存参数与 assets JS 注入代码；② `www.zip` 源包对应条目的注入代码；③ icons.json/desktop.json 用户图标配置；一键还原后用户添加的图标与注入彻底消失，且不需要任何备份文件存在即可成功
+- **WebUI 重新设计**：顶部标题栏版本徽标、容器卡片圆角 / 渐变按钮 / 响应式栅格对齐，备份卡片区新增 v2.0 零备份依赖提示文案，错误 toast 改为仅抽取 ERR/ERROR 行（不再把 INFO 成功日志拼进"失败"红色提示）
+- **升级迁移**：`upgrade_init` 先清除任意旧版本的 `.upgrade_migrated_v*` 标记；`cmd_apply` 新增 `upgrade_migration_cleanup_and_recreate`，升级后首次 apply 自动删 BACKUP_DIR 历史遗留 + APPDATA_DIR 备份副本 + www.zip.fndesk.* stray 文件 + 自愈损坏 icons.json + 精准剥离 v1.x 运行时/源包旧注入，保证新代码注入 100% 兼容
+- **幂等写入 & nginx 断开连接防线**：继续保留 v1.2.0 的四道防线（runtime_injection_is_current + safe_install_file cmp 字节比较 + /tmp 临时 + 原子 mv + 按需 reload），任何写入都不触发 trim_nginx STOP+START
+
 ## 1.2.0
 
 - **【致命】修复「任何写入操作（加图/删图/应用/开机自启）都会立刻让飞牛桌面断开连接」的根因 —— `trim_nginx.service` 的内置文件监听器会在 `/usr/trim/www/index.html` 被写入时执行**完整 STOP + START**（不是优雅 reload），所有 WebSocket 长连接瞬间被关闭：
