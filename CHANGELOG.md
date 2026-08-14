@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.2.0
+
+- **【致命】修复「任何写入操作（加图/删图/应用/开机自启）都会立刻让飞牛桌面断开连接」的根因 —— `trim_nginx.service` 的内置文件监听器会在 `/usr/trim/www/index.html` 被写入时执行**完整 STOP + START**（不是优雅 reload），所有 WebSocket 长连接瞬间被关闭：
+  - **排查证据链**：对 192.168.31.205 的 systemd journal 回溯 14 小时，发现 17 次 `trim_nginx.service` 完整重启，每次开头都一模一样：
+    `nginx will stop serve because some file has been modified: /usr/trim/www/index.html` →
+    `Stopping trim_nginx.service...` →
+    `trim_nginx.service: Deactivated successfully.` →
+    `Started trim_nginx.service - trim nginx service.`
+  - 最密集的一次：2026-08-15 `02:12:14 → 02:12:18 → 02:12:29 → 02:12:33 → 02:12:41`，**27 秒内 trim_nginx 连续完全重启 5 次**，对应用户连续添加 5 个图标时每次 `apply_inject` 都直接 `cp` 覆盖 `/usr/trim/www/index.html`
+  - 旧代码 `apply_inject` 末尾日志写的是「reload trim_nginx（不断开现有连接）」，但**真正导致断开的根本不是这行 `systemctl reload`，而是前面 13 行的 `cp -f ${tmproot}/index.html ${INDEX_HTML}`**——写入动作一发生，trim_nginx 的监听器比 systemctl reload 先启动，直接把整个 nginx STOP+START 了一轮。日志里的那句话是「以为在 reload，实际已经被监听器硬停+重启过一次」的误导性信息。
+  - **修复采取四道防线**（全部在本应用内部实现，**不修改任何飞牛原生配置 / systemd / 监听器**）：
+    1. **防线 1（幂等前置拦截，命中 99% 调用）**：新增 `runtime_injection_is_current`，`apply_inject` 开头立刻检查：① index.html 是否已含 `?v=fndesk15` 缓存参数、② 主 JS 末尾注入标记版本是否匹配 `APP_VERSION`。两项都满足 → 直接跳过所有 `/usr/trim/www` 写入，仅保留 `www.zip` 源包 patch 后 return 0。**开机自启 apply --quiet、反复点「应用配置」、连加第 2~N 个图标都会命中这里 → 0 次写盘 → 0 次 nginx 重启**。
+    2. **防线 2（cmp 字节比较前置）**：新增通用 helper `safe_install_file <src> <dst>`，替换原先的裸 `cp`。实现：先用 `cmp -s` 字节级比较临时文件与目标文件 → 完全相同则 return 0，**绝对不碰 dst（不产生任何 inotify 事件）**；只有真的不同才 `mv` 过去（同文件系统为原子 rename，不产生中间写入窗口）。返回值 `0=未变更 / 1=已替换 / >1=失败`，供上游决定是否 reload。
+    3. **防线 3（写入路径改到 /tmp + 原子 mv）**：`apply_inject`、`precise_restore_runtime_web`、`cmd_restore` 旧注入清理三段都把原本 `path.write_text(目标路径)` 或直接 `cp` 目标的写法改为：先写入 `/tmp/fndesk-*.tmp` → 交给 `safe_install_file` 或 Python 端 `filecmp.cmp + shutil.move` 语义处理后再决定是否替换目标，彻底消除无关写入。
+    4. **防线 4（按需 reload）**：`apply_inject` 末尾仅当 `idx_changed=1 || js_changed=1`（即真的替换了至少一个运行时文件）时才执行 `systemctl reload trim_nginx.service`，否则直接跳过 reload，完全消除副作用。
+  - 附带收益：`precise_restore_runtime_web` 原本在「反注入后 index.html / assets JS 已经干净」的情况下仍会 `write_text` 相同内容 → 同样触发 STOP，现在同样被 cmp 拦截，**一键还原也只会在真的有旧注入时才写盘**。
+
 ## 1.1.18
 
 - 修复「删除任一图标后其它图标全部损坏（标题/链接/图片丢失，仅显示 D 占位图标）」的致命 bug：

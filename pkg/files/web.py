@@ -65,7 +65,7 @@ DEST_JSON = os.path.join(_PKG_ETC, "desktop.json")
 
 LOG_FILE = "/var/log/fn-docker-desk.log"
 DEFAULT_PORT = 5558
-APP_VERSION = "1.1.19"
+APP_VERSION = "1.2.0"
 
 # 写操作互斥锁：ThreadingHTTPServer 并发请求下保护 icons.json 读改写
 WRITE_LOCK = threading.Lock()

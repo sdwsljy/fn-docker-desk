@@ -31,7 +31,7 @@ set -euo pipefail
 # - TRIM_PKGVAR  = /var/apps/{appname}/var      : 持久数据（升级/重装保留）
 # - TRIM_PKGETC  = /var/apps/{appname}/etc      : 应用配置目录
 # 命令行独立调用（非生命周期上下文）时可能未注入 TRIM_*，提供默认兜底。
-readonly APP_VERSION="1.1.19"                               # 应用版本（与 manifest 保持一致）
+readonly APP_VERSION="1.2.0"                               # 应用版本（与 manifest 保持一致）
 readonly FN_WWW="/usr/trim/www"                            # 飞牛 Web 根目录（系统级，不受升级影响）
 readonly INDEX_HTML="${FN_WWW}/index.html"
 
@@ -495,6 +495,44 @@ remove_icon() {
     log_info "已移除: ${key}"
 }
 
+# ---------------- 桌面注入：安全写入工具 ----------------
+# safe_install_file <src> <dst>
+#   安全安装文件到 /usr/trim/www 下（或任意被文件监听器守护的路径）：
+#   ① 先 cmp 字节比对 → 完全相同则直接 return 0，不碰 dst（不触发 inotify）
+#   ② 不同则 mv src → dst（同文件系统是原子 rename，不产生中间写入）
+#   返回 0=未变更，1=已替换，>1=失败
+safe_install_file() {
+    local src="$1" dst="$2"
+    [ -f "${src}" ] || return 2
+    [ -f "${dst}" ] || return 2
+    if cmp -s "${src}" "${dst}" 2>/dev/null; then
+        return 0
+    fi
+    if mv -f "${src}" "${dst}" 2>/dev/null; then
+        chmod 644 "${dst}" 2>/dev/null || true
+        return 1
+    fi
+    return 3
+}
+
+# runtime_injection_is_current <index_html> <asset_js_path> <expected_app_version>
+#   幂等前置检查：快速判断当前运行时 www 是否已处于「期望注入状态」
+#   通过两道签名判断：
+#     (1) index.html 里是否含 ?v=fndesk 缓存参数（说明已经 patch 过 <script src>）
+#     (2) asset 主 JS 末尾是否有匹配 expected_app_version 的 fn-docker-desk 注入标记
+#   两项都满足 → 返回 0（已注入且版本匹配，跳过所有写入，避免 trim_nginx STOP）
+runtime_injection_is_current() {
+    local index_html="$1" asset_js="$2" expected_ver="$3"
+    [ -f "${index_html}" ] || return 1
+    [ -f "${asset_js}" ] || return 1
+    # 检查 1：index.html 已经 patch 过缓存参数 ?v=fndesk
+    grep -q '?v=fndesk[0-9]\+"' "${index_html}" 2>/dev/null || return 1
+    # 检查 2：主 JS 末尾含匹配版本的注入标记
+    local marker=";/* fn-docker-desk asset injection v${expected_ver} */"
+    tail -c 16384 "${asset_js}" 2>/dev/null | grep -qF "${marker}" 2>/dev/null || return 1
+    return 0
+}
+
 # ---------------- 桌面注入 ----------------
 # 注入 fnOS 桌面：patch /usr/trim/share/.restore/www.zip 源包 + 当前运行目录
 # 失败不中断调用方（返回 1），由调用方决定是否告警
@@ -544,6 +582,28 @@ PYEOF
         return 1
     fi
 
+    # =====================================================================
+    # 防线 1：幂等前置检查 —— 如果当前运行时已注入且版本匹配，
+    #    直接跳过所有对 /usr/trim/www 的写入，完全不触发 trim_nginx STOP。
+    #    （开机自启 apply --quiet、反复按「应用配置」、连加图标都会命中这里）
+    # =====================================================================
+    if runtime_injection_is_current "${INDEX_HTML}" "${FN_WWW}/${asset}" "${APP_VERSION}"; then
+        log_info "运行时已注入且版本匹配 (${APP_VERSION})，跳过写 /usr/trim/www (避免 nginx 重启)"
+        # 源包 www.zip 仍尝试 patch 一次（保证系统重建桌面后不丢），但不 reload
+        if [ ! -f "${restore_zip}.fndesk.orig" ]; then
+            cp -f "${restore_zip}" "${restore_zip}.fndesk.orig"
+            log_info "已备份 fnOS Web 源包: ${restore_zip}.fndesk.orig"
+        fi
+        mkdir -p "${tmproot}/$(dirname "${asset}")"
+        cp "${INDEX_HTML}" "${tmproot}/index.html"
+        cp "${FN_WWW}/${asset}" "${tmproot}/${asset}"
+        cp -f "${restore_zip}" "${restore_zip}.fndesk.bak.$(date +%Y%m%d%H%M%S)"
+        ls -1t "${restore_zip}".fndesk.bak.* 2>/dev/null | tail -n +3 | xargs -r rm -f 2>/dev/null || true
+        (cd "${tmproot}" && zip -q -u "${restore_zip}" index.html "${asset}") 2>/dev/null || true
+        log_info "已 patch fnOS Web 源包（跳过 reload：运行时未变更，避免断开现有连接）"
+        return 0
+    fi
+
     mkdir -p "${tmproot}/$(dirname "${asset}")"
     cp "${INDEX_HTML}" "${tmproot}/index.html"
     cp "${FN_WWW}/${asset}" "${tmproot}/${asset}"
@@ -588,17 +648,38 @@ PYEOF
         cp -f "${FN_WWW}/${asset}" "${BACKUP_DIR}/$(basename "${asset}").runtime.orig" 2>/dev/null || true
         log_info "已备份当前运行 JS: ${BACKUP_DIR}/$(basename "${asset}").runtime.orig"
     fi
-    if ! cp -f "${tmproot}/index.html" "${INDEX_HTML}" 2>/dev/null; then
-        log_warn "写入当前运行 index.html 失败: ${INDEX_HTML}"
-        return 1
-    fi
-    if ! cp -f "${tmproot}/${asset}" "${FN_WWW}/${asset}" 2>/dev/null; then
-        log_warn "写入当前运行 JS 失败: ${FN_WWW}/${asset}"
-        return 1
-    fi
-    chmod 644 "${INDEX_HTML}" "${FN_WWW}/${asset}" 2>/dev/null || true
-    log_info "已 patch 当前运行目录 /usr/trim/www，刷新后立即生效"
 
+    # =====================================================================
+    # 防线 2 & 3：safe_install_file = cmp 字节比较 + 原子 mv
+    #   结果 idx_changed / js_changed：0=未变更  1=已替换  >1=失败
+    #   只有真的改了文件才会把写入事件送到 trim_nginx 文件监听器
+    # =====================================================================
+    local idx_changed=0 js_changed=0
+    local idx_tmp js_tmp
+    idx_tmp="${tmproot}/index.html.to_install.$$"
+    js_tmp="${tmproot}/$(dirname "${asset}")/$(basename "${asset}").to_install.$$"
+    cp -f "${tmproot}/index.html" "${idx_tmp}" 2>/dev/null
+    cp -f "${tmproot}/${asset}" "${js_tmp}" 2>/dev/null
+
+    safe_install_file "${idx_tmp}" "${INDEX_HTML}" 2>/dev/null || idx_changed=$?
+    if [ "${idx_changed}" -ge 3 ]; then
+        log_warn "写入当前运行 index.html 失败 (safe_install rc=${idx_changed}): ${INDEX_HTML}"
+        return 1
+    fi
+
+    safe_install_file "${js_tmp}" "${FN_WWW}/${asset}" 2>/dev/null || js_changed=$?
+    if [ "${js_changed}" -ge 3 ]; then
+        log_warn "写入当前运行 JS 失败 (safe_install rc=${js_changed}): ${FN_WWW}/${asset}"
+        return 1
+    fi
+
+    if [ "${idx_changed}" -eq 1 ] || [ "${js_changed}" -eq 1 ]; then
+        log_info "已 patch 当前运行目录 /usr/trim/www (index_changed=${idx_changed}, js_changed=${js_changed})，刷新后立即生效"
+    else
+        log_info "运行时已为最新注入 (${APP_VERSION})，跳过写 /usr/trim/www (避免 nginx 重启)"
+    fi
+
+    # ------- 源包 patch（/usr/trim/share/.restore/www.zip 不在 www 目录，不触发监听器） -------
     if [ ! -f "${restore_zip}.fndesk.orig" ]; then
         cp -f "${restore_zip}" "${restore_zip}.fndesk.orig"
         log_info "已备份 fnOS Web 源包: ${restore_zip}.fndesk.orig"
@@ -611,8 +692,17 @@ PYEOF
         return 1
     fi
 
-    systemctl reload trim_nginx.service 2>/dev/null || true
-    log_info "已 patch fnOS Web 源包并 reload trim_nginx（不断开现有连接）"
+    # =====================================================================
+    # 防线 4：reload trim_nginx 仅在「至少一个运行时文件真的被替换」时才执行
+    #   若 idx_changed=0 && js_changed=0 → 没碰磁盘 → 不需要 reload → 不会引起任何副作用
+    # =====================================================================
+    if [ "${idx_changed}" -eq 1 ] || [ "${js_changed}" -eq 1 ]; then
+        systemctl reload trim_nginx.service 2>/dev/null || true
+        log_info "已 patch fnOS Web 源包并 reload trim_nginx"
+    else
+        log_info "已 patch fnOS Web 源包（跳过 reload：运行时未变更，避免断开现有连接）"
+    fi
+    return 0
 }
 
 # 发布桌面 JSON：从主配置 CONF_JSON 生成桌面端读取的 DEST_JSON（并兼容旧 userimg 路径）
@@ -1030,11 +1120,18 @@ PYEOF
 precise_restore_runtime_web() {
     [ -f "${INDEX_HTML}" ] || return 1
     command -v python3 >/dev/null 2>&1 || return 1
+    # 写入策略（避免触发 trim_nginx 文件监听器）：
+    #   - 所有内容改动先写到 /tmp 临时文件
+    #   - cmp 字节比对目标文件：相同则丢弃临时文件，不碰原文件；不同再原子 mv
     # 返回值：0=已更新；2=未发现注入（已干净）；非0=处理失败
     python3 - "${INDEX_HTML}" <<'PYEOF'
+import filecmp
+import os
 import pathlib
 import re
+import shutil
 import sys
+import tempfile
 
 idx_path = pathlib.Path(sys.argv[1])
 idx = idx_path.read_text("utf-8", errors="replace")
@@ -1042,8 +1139,20 @@ idx = idx_path.read_text("utf-8", errors="replace")
 new_idx = re.sub(r'\?v=fndesk[0-9]+"', '"', idx)
 changed = False
 if new_idx != idx:
-    idx_path.write_text(new_idx, "utf-8")
-    changed = True
+    _t = pathlib.Path(tempfile.mkstemp(prefix="fndesk-runtime-idx-", suffix=".html")[1])
+    _t.write_text(new_idx, "utf-8")
+    try:
+        if not filecmp.cmp(str(_t), str(idx_path), shallow=False):
+            shutil.move(str(_t), str(idx_path))
+            os.chmod(str(idx_path), 0o644)
+            changed = True
+        else:
+            _t.unlink(missing_ok=True)
+    except Exception as e:
+        _t.unlink(missing_ok=True)
+        print("safe_install failed for index.html: %s" % e, file=sys.stderr)
+        sys.exit(1)
+
 # 2. 遍历 assets 下所有 js，清除 fn-docker-desk 注入代码（覆盖桌面升级后文件名变化的情况）
 marker = re.compile(r';/\* fn-docker-desk asset injection v[01]\.[0-9.]+ \*/')
 assets_dir = pathlib.Path("/usr/trim/www/assets")
@@ -1055,11 +1164,23 @@ if assets_dir.is_dir():
             continue
         parts = marker.split(js, maxsplit=1)
         if len(parts) > 1:
+            cleaned = parts[0].rstrip() + "\n"
             try:
-                js_path.write_text(parts[0].rstrip() + "\n", "utf-8")
-                changed = True
-            except Exception:
-                print("failed to clean: %s" % js_path, file=sys.stderr)
+                _t = pathlib.Path(tempfile.mkstemp(prefix="fndesk-runtime-js-", suffix=".js")[1])
+                _t.write_text(cleaned, "utf-8")
+                try:
+                    if not filecmp.cmp(str(_t), str(js_path), shallow=False):
+                        shutil.move(str(_t), str(js_path))
+                        os.chmod(str(js_path), 0o644)
+                        changed = True
+                    else:
+                        _t.unlink(missing_ok=True)
+                except Exception as e:
+                    _t.unlink(missing_ok=True)
+                    print("safe_install failed: %s -> %s: %s" % (_t, js_path, e), file=sys.stderr)
+                    sys.exit(1)
+            except Exception as e:
+                print("failed to clean: %s: %s" % (js_path, e), file=sys.stderr)
 print("runtime precise restore " + ("updated" if changed else "no injection found"))
 sys.exit(0 if changed else 2)
 PYEOF
@@ -1115,23 +1236,41 @@ cmd_restore() {
     log_warn "开始还原到原始飞牛桌面..."
 
     # 1. 兼容 v0.2 旧方案：如果运行目录 index.html 里仍有标记，先删除标记块
+    #    安全写入：先写 /tmp 临时文件，cmp 不同再原子 mv，避免触发 trim_nginx 文件监听器
     if [ -f "${INDEX_HTML}" ] && grep -q "${MARKER_START}" "${INDEX_HTML}"; then
         if command -v python3 >/dev/null 2>&1; then
-            python3 - "${INDEX_HTML}" <<'PYEOF'
+            local _legacy_tmp _legacy_changed=0
+            _legacy_tmp="$(mktemp /tmp/fndesk-legacy-XXXXXX.html)"
+            if python3 - "${INDEX_HTML}" "${_legacy_tmp}" <<'PYEOF'
+import filecmp
+import os
+import shutil
 import sys
-path = sys.argv[1]
+src, dst = sys.argv[1], sys.argv[2]
 ms = '<!-- fn-docker-desk:start -->'
 me = '<!-- fn-docker-desk:end -->'
-with open(path, encoding='utf-8') as f:
+with open(src, encoding='utf-8') as f:
     content = f.read()
 s = content.find(ms); e = content.find(me)
 if s != -1 and e != -1 and e > s:
     content = content[:s] + content[e + len(me):]
-with open(path, 'w', encoding='utf-8') as f:
+with open(dst, 'w', encoding='utf-8') as f:
     f.write(content)
-print('legacy injection removed')
 PYEOF
-            log_info "已移除旧版 index.html 注入脚本"
+            then
+                # safe_install_file 语义：字节相同则不触碰原文件（返回 0 未变更）
+                safe_install_file "${_legacy_tmp}" "${INDEX_HTML}" >/dev/null 2>&1 || _legacy_changed=$?
+                if [ "${_legacy_changed}" -eq 1 ]; then
+                    log_info "已移除旧版 index.html 注入脚本（运行时文件已更新）"
+                elif [ "${_legacy_changed}" -eq 0 ]; then
+                    log_info "已移除旧版 index.html 注入脚本（内容相同，跳过写盘避免 nginx 重启）"
+                else
+                    log_warn "移除旧版 index.html 注入脚本失败 (safe_install rc=${_legacy_changed})"
+                fi
+            else
+                log_warn "缺少 python3 执行失败，跳过旧版 index.html 精确清理"
+            fi
+            rm -f "${_legacy_tmp}"
         else
             log_warn "缺少 python3，跳过旧版 index.html 精确清理"
         fi
