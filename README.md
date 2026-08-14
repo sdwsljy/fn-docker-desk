@@ -2,7 +2,7 @@
 
 把 Docker 容器应用一键添加到飞牛 OS（fnOS）桌面。通过飞牛应用中心安装 `.fpk` 应用包后，桌面出现「飞牛桌面图标」入口，可视化地把任意 Docker 容器"钉"到桌面，点击直达服务页面。
 
-- 当前版本：**v1.1.6**
+- 当前版本：**v1.1.17**
 - 支持平台：fnOS（x86 / ARM，需 V1.1.8+）
 - 开发维护：胖啥胖
 
@@ -21,16 +21,16 @@
   3. 内置常见应用图标映射（ghproxy / jsdelivr 加速）
   4. 首字母渐变占位图标
 - **桌面注入鲁棒**：多版本选择器兼容 + 特征探测兜底，MutationObserver 持续监控，React 重渲染后自动恢复图标
-- **修改前自动备份**：每次修改系统 Web 文件前备份到 `/usr/fn-docker-desk/backup/`
+- **修改前自动备份**：每次修改系统 Web 文件前备份到 `/var/apps/fn-docker-desk/var/backup/`
 - **开机持久化**：systemd 服务保证重启后注入自动恢复
 - **一键还原安全**：还原时保留本应用自身图标，仅清理用户添加的图标；不再整体覆盖系统源包（保护应用商城已装应用）；还原后进入"还原态"，重新启动应用不会自动生成图标，重新添加即恢复
-- **SSH 兼容**：同时提供命令行工具 `/usr/fn-docker-desk/fn-docker-desk.sh`
+- **SSH 兼容**：通过 usr-local-linker 注册稳定命令 `/usr/local/bin/fn-docker-desk`，可在任意上下文调用
 
 ## 安装
 
 ### 应用中心手动安装（推荐）
 
-1. 下载 `fn-docker-desk_1.1.6_all.fpk`
+1. 下载 `fn-docker-desk_1.1.17_all.fpk`
 2. 登录飞牛 NAS 桌面 → 打开「应用中心」→ 左下角「手动安装」
 3. 选择 fpk 文件上传，确认安装
 4. 安装完成后桌面出现「飞牛桌面图标」，点击打开管理面板
@@ -41,7 +41,7 @@
 ### 命令行安装（可选）
 
 ```bash
-sudo appcenter-cli install-fpk /path/to/fn-docker-desk_1.1.6_all.fpk --volume 1
+sudo appcenter-cli install-fpk /path/to/fn-docker-desk_1.1.17_all.fpk --volume 1
 sudo appcenter-cli start fn-docker-desk
 ```
 
@@ -63,10 +63,9 @@ sudo appcenter-cli start fn-docker-desk
 
 ### SSH 命令行
 
-```bash
-# 常用别名
-fn-docker-desk() { bash /usr/fn-docker-desk/fn-docker-desk.sh "$@"; }
+CLI 已通过 usr-local-linker 注册到 `/usr/local/bin/fn-docker-desk`，安装后可直接调用：
 
+```bash
 # 列出运行中的容器
 fn-docker-desk list
 
@@ -110,14 +109,17 @@ fn-docker-desk restore
 
 ## 文件与目录
 
+按飞牛 fnOS 官方规范布局：
+
 | 路径 | 说明 |
 |------|------|
-| `/usr/fn-docker-desk/fn-docker-desk.sh` | 命令行工具主脚本 |
-| `/usr/fn-docker-desk/web.py` | Web 管理面板（Python 标准库，端口 5558） |
-| `/usr/fn-docker-desk/icons.json` | 工具主配置（用户图标列表） |
-| `/usr/fn-docker-desk/desktop.json` | 发布给桌面读取的配置 |
-| `/usr/fn-docker-desk/icons/` | 图标图片目录 |
-| `/usr/fn-docker-desk/backup/` | 系统文件自动备份 |
+| `/var/apps/fn-docker-desk/target/bin/fn-docker-desk` | CLI 主脚本（由 usr-local-linker 链接至 `/usr/local/bin/fn-docker-desk`） |
+| `/var/apps/fn-docker-desk/target/web.py` | Web 管理面板（Python 标准库，端口 5558） |
+| `/var/apps/fn-docker-desk/target/desktop-inject.js` | 桌面注入 JS |
+| `/var/apps/fn-docker-desk/var/icons.json` | 主配置（用户图标列表，持久化） |
+| `/var/apps/fn-docker-desk/var/icons/` | 图标图片目录（持久化） |
+| `/var/apps/fn-docker-desk/var/backup/` | 系统文件自动备份（持久化） |
+| `/var/apps/fn-docker-desk/etc/desktop.json` | 发布给桌面读取的配置 |
 | `/usr/local/apps/@appdata/fn-docker-desk` | 持久卷（升级/重装自动恢复） |
 | `/etc/systemd/system/fn-docker-desk.service` | 开机自启服务 |
 | `/var/log/fn-docker-desk.log` | 操作日志 |
@@ -147,19 +149,18 @@ fn-docker-desk restore
 遵循飞牛官方 fnpack 规范（[官方文档](https://developer.fnnas.com/docs/core-concepts/manifest/)）：
 
 ```
-fn-docker-desk_1.1.6_all.fpk (tar.gz)
+fn-docker-desk_1.1.17_all.fpk (tar.gz)
 ├── manifest              # 应用清单（appname/version/service_port/desktop_uidir...）
 ├── ICON.PNG / ICON_256.PNG
-├── app.tgz               # 应用文件，解压到 target（含 ui/config 桌面入口注册）
-│   ├── fn-docker-desk.sh
-│   ├── web.py
-│   ├── desktop-inject.js
+├── app.tgz               # 应用文件，解压到 target
+│   ├── bin/fn-docker-desk   # CLI 主脚本（usr-local-linker 注册到 /usr/local/bin/）
+│   ├── web.py               # Web 管理面板
+│   ├── desktop-inject.js    # 桌面注入 JS
 │   └── ui/
-│       ├── config        # 桌面入口（desktop_applaunchname 对应）
-│       └── images/       # icon_64.png / icon_256.png
-├── cmd/                  # 生命周期脚本（main/install_*/upgrade_*/uninstall_*/config_*）
-├── config/               # privilege（run-as: root）+ resource
-└── wizard/               # 安装向导（可选）
+│       ├── config           # 桌面入口（desktop_applaunchname 对应）
+│       └── images/          # icon_64.png / icon_256.png
+├── cmd/                  # 生命周期脚本（main/install_callback/upgrade_callback/uninstall_callback）
+└── config/               # privilege（run-as: root）+ resource（usr-local-linker）
 ```
 
 本地重打包可运行项目内脚本：
@@ -168,7 +169,7 @@ fn-docker-desk_1.1.6_all.fpk (tar.gz)
 python scripts/build_fpk.py
 ```
 
-脚本只依赖 Python 标准库，输出文件位于 `dist/fn-docker-desk_1.1.6_all.fpk`。
+脚本只依赖 Python 标准库，输出文件位于 `dist/fn-docker-desk_1.1.17_all.fpk`。
 
 ## 开发与测试
 
@@ -177,18 +178,18 @@ python scripts/build_fpk.py
 ```
 fn-docker-desk/
 ├── pkg/files/               # 应用核心文件（打包进 app.tgz）
-│   ├── fn-docker-desk.sh    # 主脚本（容器发现/图标提取/桌面注入/还原）
+│   ├── fn-docker-desk.sh    # 主脚本（容器发现/图标提取/桌面注入/还原），打包为 bin/fn-docker-desk
 │   ├── web.py               # Web 管理面板后端（Python 标准库）
 │   └── desktop-inject.js    # 桌面注入 JS（独立文件，便于维护）
 ├── pkg/fnos/                # fnOS 应用配置
 │   ├── manifest             # 应用清单
-│   ├── cmd/                 # 生命周期脚本（main/install_*/upgrade_*/uninstall_*）
-│   ├── config/              # privilege + resource
+│   ├── cmd/                 # 生命周期脚本（main/install_callback/upgrade_callback/uninstall_callback）
+│   ├── config/              # privilege + resource（usr-local-linker）
 │   └── ui/                  # 桌面入口（config + 图标）
 ├── scripts/build_fpk.py     # 打包脚本
 ├── tests/                   # 单元测试
-│   ├── test_web.py          # web.py 测试（47 个）
-│   ├── test_build_fpk.py    # build_fpk.py 测试（10 个）
+│   ├── test_web.py          # web.py 测试
+│   ├── test_build_fpk.py    # build_fpk.py 测试
 │   └── test_shell_functions.sh  # Shell 函数测试
 ├── .github/workflows/       # CI（lint + test + build）
 └── .flake8                  # Python 代码风格配置
@@ -230,7 +231,17 @@ GitHub Actions（`.github/workflows/validate.yml`）在 push/PR 时自动运行�
 
 | 版本 | 内容 |
 |------|------|
-| 1.1.6 | 安全与稳定性修复：升级后 Web 面板降权失效（恢复 root）；图标 URL 强制 http/https 防 file:// 读取与 SSRF（上传图标同时修复）；CORS 收窄至 /api/icons；写接口加锁防并发竞态；上传图片 magic bytes 校验；清理死代码；容器名固定匹配；SVG 占位转义 |
+| 1.1.17 | 修复一键还原后旧图标复活（清理旧路径 + 写迁移标记 + migrate 还原态防御）；修复 restore_data_from_appdata 误判空配置导致图标复活；backup_data_to_appdata 三处 cp 失败独立打 warn 提升可观测性 |
+| 1.1.16 | 修复从任意旧版本无法通过应用商店一键升级到 1.1.15 的 rc 泄漏（未处理 --version、只读命令未 return 0、cmd_ls jq 兜底）；修复 TRIM_PKGVAR 与 APPDATA_DIR 重合时图标目录被误删 |
+| 1.1.15 | 修复 web 界面卡在「加载中」：重写 handle_error 统一返回 JSON 500；前端 api() 改 r.text + JSON.parse 兜底；PAGE 改 raw string 替换消除 SyntaxWarning；refreshAll 全局 try-catch |
+| 1.1.13 | 修复 cmd_apply 末句裸 && 在 --quiet 时 rc=1 泄漏（改 `{ ...; } \|\| true`）；4 个写入口函数显式 return 0 兜底 |
+| 1.1.12 | 修复写操作成功但前端提示失败：set -e 下裸 cp 失败致整体 rc≠0；新增 failReason() 仅抽取错误行作为失败文案 |
+| 1.1.11 | 修复从飞牛桌面打开面板时写接口全部 403：CSRF 放宽为仅比较 hostname（忽略端口），保留跨主机拦截 |
+| 1.1.10 | 修复非 root 用户调用 CLI 时 /var/log 写权限不足向 stderr 泄漏 Permission denied；_log_file 兜底到 PKG_VAR/log/ |
+| 1.1.9 | 修复非生命周期上下文（SSH 直连）下 TRIM_PKGMETA unbound variable 崩溃；对齐官方路径与 usr-local-linker 打包 |
+| 1.1.8 | 修复 HTTP 状态码语义：CSRF/10MB/上传超限返回 403/400 而非 200 |
+| 1.1.7 | 全部 POST 新增 CSRF 同源校验 + 10MB 请求体上限；修复 SVC_PORT 未定义 |
+| 1.1.6 | 安全与稳定性修复：升级后 Web 面板降权失效（恢复 root）；图标 URL 强制 http/https 防 file:// 读取与 SSRF；CORS 收窄至 /api/icons；写接口加锁防并发竞态；上传图片 magic bytes 校验；清理死代码；容器名固定匹配；SVG 占位转义 |
 | 1.1.5 | 修复一键还原后桌面图标无法移除：注入 JS 空数据时立即清理全部已渲染图标 |
 | 1.1.4 | 修复一键还原失效：反注入兼容 fnOS 桌面结构变化（清除全部 fndesk 参数 + 遍历 assets js 清除注入），运行时/www.zip 双重校验 + 备份兜底 |
 | 1.1.3 | 按官方 fnpack 规范修复应用中心手动安装报错：移除 manifest 多余 checksum 空字段；os_min_version 与 platform=all 对齐（fnOS 1.1.8+） |

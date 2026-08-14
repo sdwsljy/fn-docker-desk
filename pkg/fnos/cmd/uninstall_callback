@@ -1,10 +1,17 @@
 #!/bin/bash
-# 飞牛桌面图标 - 卸载后处理
-# 温和卸载：移除注入与自启服务，用户图标配置先备份到持久卷（升级场景可恢复）
-DEST_DIR="/usr/fn-docker-desk"
-if [ -f "$DEST_DIR/fn-docker-desk.sh" ]; then
-    bash "$DEST_DIR/fn-docker-desk.sh" uninstall 2>/dev/null || true
+# 飞牛桌面图标 - 卸载后处理（温和卸载）
+# 保留 PKG_VAR 下的用户图标配置；仅移除注入与自启服务
+readonly APP_NAME="${TRIM_APPNAME:-fn-docker-desk}"
+readonly APP_DIR="/var/apps/${APP_NAME}"
+readonly PKG_APP="${TRIM_APPDEST:-${APP_DIR}/target}"
+readonly CLI_ENTRY="${PKG_APP}/bin/fn-docker-desk"
+readonly PKG_VAR="${TRIM_PKGVAR:-${APP_DIR}/var}"
+
+if [ -x "${CLI_ENTRY}" ]; then
+    bash "${CLI_ENTRY}" uninstall 2>/dev/null || true
 fi
-# 说明：用户配置已备份到 @appdata 持久卷，重装/升级后自动恢复；此处保留目录避免误删
-rm -rf "$DEST_DIR/backup" 2>/dev/null || true
+
+# 说明：PKG_VAR 下的用户配置与备份由系统卸载流程处理（按官方规范保留）
+# 此处清理备份目录（由应用自身管理的 index.html / JS 备份），避免残留旧备份
+rm -rf "${PKG_VAR}/backup" 2>/dev/null || true
 exit 0

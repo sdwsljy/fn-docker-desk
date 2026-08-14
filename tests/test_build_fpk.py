@@ -25,8 +25,28 @@ class TestReadManifestVersion:
             assert p.isdigit(), f"版本号部分 '{p}' 不是数字"
 
     def test_version_matches_expected(self, build_module):
-        version = build_module.read_manifest_version()
-        assert version == "1.1.6"
+        """校验三处版本号一致：manifest == web.py APP_VERSION == fn-docker-desk.sh APP_VERSION。"""
+        manifest_version = build_module.read_manifest_version()
+        assert manifest_version
+
+        web_py = (ROOT / "pkg" / "files" / "web.py").read_text(encoding="utf-8")
+        sh = (ROOT / "pkg" / "files" / "fn-docker-desk.sh").read_text(encoding="utf-8")
+
+        import re
+        web_m = re.search(r'^APP_VERSION\s*=\s*"([^"]+)"', web_py, re.M)
+        sh_m = re.search(r'^readonly APP_VERSION="([^"]+)"', sh, re.M)
+
+        assert web_m, "web.py 未找到 APP_VERSION 定义"
+        assert sh_m, "fn-docker-desk.sh 未找到 readonly APP_VERSION 定义"
+        web_version = web_m.group(1)
+        sh_version = sh_m.group(1)
+
+        assert manifest_version == web_version, (
+            f"manifest.version ({manifest_version}) != web.py APP_VERSION ({web_version})"
+        )
+        assert manifest_version == sh_version, (
+            f"manifest.version ({manifest_version}) != fn-docker-desk.sh APP_VERSION ({sh_version})"
+        )
 
 
 # ==================== build_app_tgz ====================
@@ -41,8 +61,8 @@ class TestBuildAppTgz:
 
         with tarfile.open(output, "r:gz") as tar:
             names = tar.getnames()
-            # 必须包含核心文件
-            assert "fn-docker-desk.sh" in names
+            # 必须包含核心文件（usr-local-linker 规范：CLI 入口放 bin/fn-docker-desk，无 .sh 后缀）
+            assert "bin/fn-docker-desk" in names
             assert "web.py" in names
             assert "desktop-inject.js" in names
             # ui 目录
@@ -55,9 +75,9 @@ class TestBuildAppTgz:
 
         with tarfile.open(output, "r:gz") as tar:
             for member in tar.getmembers():
-                if member.name == "fn-docker-desk.sh":
+                if member.name == "bin/fn-docker-desk":
                     # 0o755 = 493
-                    assert member.mode == 0o755, f"fn-docker-desk.sh 权限应为 755, 实际为 {oct(member.mode)}"
+                    assert member.mode == 0o755, f"bin/fn-docker-desk 权限应为 755, 实际为 {oct(member.mode)}"
 
 
 # ==================== build_fpk ====================
@@ -94,10 +114,10 @@ class TestBuildFpk:
         package = build_module.build_fpk("1.1.6")
 
         executable_names = {
-            "main", "install_init", "install_callback",
-            "upgrade_init", "upgrade_callback",
-            "uninstall_init", "uninstall_callback",
-            "config_init", "config_callback",
+            "main",
+            "install_callback",
+            "upgrade_callback",
+            "uninstall_callback",
         }
 
         with tarfile.open(package, "r:gz") as tar:
@@ -109,7 +129,7 @@ class TestBuildFpk:
         monkeypatch.setattr(build_module, "DIST", tmp_path)
         # 不传 version 参数时，应从 manifest 读取
         package = build_module.build_fpk(build_module.read_manifest_version())
-        assert "1.1.6" in package.name
+        assert build_module.read_manifest_version() in package.name
 
 
 # ==================== 打包一致性 ====================

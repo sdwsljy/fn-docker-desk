@@ -1,5 +1,68 @@
 # Changelog
 
+## 1.1.17
+
+- 修复 3 处致命/高危漏洞：
+  - **【致命】一键还原后旧图标复活**：`cmd_restore` 仅清空 PKG_VAR 官方路径 `icons.json`，但未清理 v0.2 遗留 `/usr/fn-docker-desk` 旧路径下的 `icons.json`/`desktop.json`/图标图片，也未写入 `.migrated_from_usr_fndesk` 迁移标记；随后 `cmd_add` 调用 `init_dirs` → `migrate_legacy_paths` 判定「新配置为空且旧路径有数据」→ 把旧路径 icons.json（满是已被用户删除的旧图标）整包迁移回 CONF_JSON → 旧图标 + 新图标一起出现。修复采用三道防线：
+    1. `cmd_restore` 步骤 5 新增清理逻辑：`rm -f /usr/fn-docker-desk/icons.json`、`/usr/fn-docker-desk/desktop.json`、`/usr/fn-docker-desk/.restored`，清空 `/usr/fn-docker-desk/icons` 下所有用户图标图片与 backup 目录下用户配置备份
+    2. `cmd_restore` 同步写 PKG_VAR 与 APPDATA_DIR 双路径迁移标记 `.migrated_from_usr_fndesk`，确保还原后 `migrate_legacy_paths` 不触发
+    3. `migrate_legacy_paths` 函数开头新增还原态防御：若 `PKG_VAR/.restored` 或 `APPDATA_DIR/.restored` 存在则直接 return 0，绝不从旧路径迁回任何数据
+  - **【高危】restore_data_from_appdata 误判空配置**：`jq` 解析主配置失败时原用 `|| echo 0` 兜底，会误判为「主配置为空」→ 触发从 APPDATA_DIR 备份恢复旧图标（即使备份里是用户已删除的旧数据），导致 apply 时旧图标复活。修复：`jq` 解析失败时不再 echo 0 伪装空数组，而是 log_warn + return 0 跳过恢复；新增文件 size<4 辅助判空（只有真正 0 字节/空数组才恢复）；cp 失败时独立打 warn 不再与成功路径混淆
+  - **【日志可观测性】** `backup_data_to_appdata` 内部 3 处 cp 操作原本 `|| true` 静默吞错，与「暂无配置」case 混淆打印相同日志，排查时无法判断备份是否真的失败；修复后对 `icons.json`/`desktop.json`/`icons` 目录 3 处 cp 失败全部独立打 `[WARN]` 日志，末尾 ok 判定区分「真暂无配置」与「存在但备份失败」
+
+## 1.1.16
+
+- 修复从任意旧版本（1.1.11/1.1.13）无法通过飞牛应用商店一键升级到 1.1.15 的致命问题。应用中心升级流程在 `set -e` 严格模式下对任一子命令非零 rc 零容忍，而 v1.1.15 中 CLI 共有 3 处 rc 泄漏导致升级整体被判失败：
+  1. CLI 主入口 case 未处理 `--version`/`-v`/`-V` 查询版本参数，命中 `*)` 分支 → usage 打印 banner 后 `exit 1`（应用中心任何版本校验触发非零退出）
+  2. `cmd_list`/`cmd_ls`/`cmd_backups`/`cmd_status` 四个只读命令未显式 `return 0`，`while read` 循环末尾 EOF 的 read rc=1 泄漏为函数返回值
+  3. `cmd_ls` 中 `jq` 读取 icons.json 缺失兜底，空配置时 `jq exit 4` → set -e 直接中断
+- 同时修复潜在图标目录删除高危问题：fnOS 上 `TRIM_PKGVAR` 可能指向 `/usr/local/apps/@appdata/fn-docker-desk`，与 `APPDATA_DIR` 完全重合，导致 `backup_data_to_appdata` 里「先 rm -rf APPDATA_DIR/icons 再 cp -rf IMAGE_DIR APPDATA_DIR/icons」= 先删除真正的图标目录再复制不存在的源。修复：内部先 `readlink -f` 归一化源/目标路径，重合时直接跳过复制并视为成功
+
+## 1.1.15
+
+- 修复 web 界面打开后一直卡在「加载中…」、容器/图标/备份信息不显示的致命体验问题：
+  - Python 端未重写 `BaseHTTPRequestHandler.handle_error`：`do_GET`/`do_POST` 内任一步抛异常时，Python 默认输出 HTML 500 页而非前端期望的 JSON。Handler 新增 `handle_error()` 重写，统一返回 JSON 500（含友好错误摘要）
+  - 前端 `api()` 直接 `r.json()`，遇到 HTML 响应抛 SyntaxError。改为先 `r.text()` 再 `try JSON.parse(text)`，非 JSON 时自动剥离 HTML 标签、截取 200 字摘要并打包成 `{ok:false, output:...}`
+  - PAGE 字符串拼接 `v""" + APP_VERSION + """` 使后半段 HTML/JS 退化为普通字符串，内含 JS 正则触发 Python SyntaxWarning。改为 `PAGE_TEMPLATE.replace("__APP_VERSION__", APP_VERSION)`，全程 raw string
+  - `refreshAll()` 外层新增全局 try-catch，致命异常时替换所有仍含「加载中」的 DOM 为红色错误提示（含日志路径）
+
+## 1.1.13
+
+- 在 v1.1.12 双层防御基础上再补两道防线，彻底解决「实际成功，但 web.py subprocess.returncode≠0 判为失败 → [web] 命令失败/前端 toast 红字失败」的 rc 泄漏问题
+- `cmd_apply` 的末句原是裸写 `[ "$1" != "--quiet" ] && log_info ...`，当 `apply --quiet` 调用（升级/安装生命周期内部调用）时条件为假导致整条语句 rc=1，又因为是函数最后一条命令 → 函数返回 rc=1（实际全部成功）。修复改用 `{ [ cond ] && log_info; } || true` 包裹，并给 `cmd_add`/`cmd_add_custom`/`cmd_remove`/`cmd_apply` 四个写入口函数末显式写 `return 0` 兜底
+
+## 1.1.12
+
+- 修复「添加/删除/应用配置/一键还原」写操作成功但前端提示「移除失败/添加失败」并把 [INFO] 成功日志拼进失败文案的 bug：
+  - 根因是脚本启用 `set -euo pipefail` 后，`backup_data_to_appdata` 内两处裸 cp 在遇到瞬时文件锁/特殊属性/SELinux 拦截返回非零时，直接导致整个 shell 脚本以 rc≠0 退出
+  - 脚本层：`publish_json` 中首次备份 cp、`chmod 644`/`-R 755` 全部加 `2>/dev/null || true`；`backup_data_to_appdata` 内部裸 cp 改为 `|| true` 或 if 包裹
+  - 前端层：新增 `failReason(output)` 工具函数，从后端原始 output 中仅抽取 [ERR]/[ERROR]/错误关键词行作为失败文案，无错误行时用清晰兜底文案（含日志路径）
+
+## 1.1.11
+
+- 修复从飞牛桌面打开管理面板时，「添加/删除/应用配置/一键还原」全部写接口 403「跨站请求已拦截」的问题
+- fnOS 桌面站点（:80/:443）与本管理面板（manifest 默认 :5558）分属不同端口，原先 CSRF 严格比较 netloc 含端口导致合法调用被误杀。现放宽为仅比较 Origin/Referer 与 Host 头的主机名（hostname，不含端口/协议），同时保留对跨主机（如 evil.com）Origin 的 403 拦截
+
+## 1.1.10
+
+- 修复 usr-local-linker 路径 CLI 在非 root 用户（如 SSH admin）下调用时，`log_message` 写 `/var/log/fn-docker-desk.log` 权限不足而向 stderr 泄漏 `Permission denied` 警告的问题
+- `_log_file` 先检测主日志可写性，不可写时自动兜底到 `PKG_VAR/log/fn-docker-desk.log`；并修正 shell 重定向顺序 `{ printf ...; } 2>/dev/null >> file` 保证重定向打开失败时消息不泄漏控制台
+
+## 1.1.9
+
+- 修复 usr-local-linker 命令在非生命周期上下文（SSH 直连或外部调用）独立执行时，因 bash nounset 模式导致 `TRIM_PKGMETA: unbound variable` 崩溃
+- 同步对齐打包路径 usr-local-linker `bin/fn-docker-desk`、官方 `/var/apps/{appname}/target|var|etc` 结构与旧路径自动迁移
+
+## 1.1.8
+
+- 修复 HTTP 状态码语义错误：CSRF/10MB/上传超限返回 403/400 而非 200，并修正上传接口异常分支未透传非 2xx 问题
+
+## 1.1.7
+
+- 全部 POST 新增 CSRF 同源校验 + 10MB 请求体上限
+- 修复 SVC_PORT 未定义
+- banner 版本号统一引用 APP_VERSION
+
 ## 1.1.6
 
 - 安全与稳定性修复（不加鉴权，保持内网工具定位）：
@@ -12,7 +75,6 @@
   - **容器名匹配**：`resolve_container` 改固定字符串匹配，避免 `.` 等被当正则元字符
   - **SVG 占位转义**：`gen_fallback_icon` 对首字符做 XML 转义
   - **打包脚本**：`add_file` 按 shebang 判定可执行位，取代硬编码文件名清单
-  - 同步仓库根目录冗余 `fn-docker-desk.sh` 副本至最新
 
 ## 1.1.5
 

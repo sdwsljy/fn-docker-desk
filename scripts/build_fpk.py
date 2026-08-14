@@ -49,7 +49,9 @@ def add_tree(tar: tarfile.TarFile, base: Path, arcbase: str) -> None:
 
 def build_app_tgz(output: Path) -> None:
     with tarfile.open(output, "w:gz") as tar:
-        add_file(tar, FILES / "fn-docker-desk.sh", "fn-docker-desk.sh")
+        # usr-local-linker 规范：bin/ 条目路径相对于 target 目录
+        # 将 pkg/files/fn-docker-desk.sh 打包为 bin/fn-docker-desk（无 .sh 后缀，保持可执行权限）
+        add_file(tar, FILES / "fn-docker-desk.sh", "bin/fn-docker-desk")
         add_file(tar, FILES / "web.py", "web.py")
         add_file(tar, FILES / "desktop-inject.js", "desktop-inject.js")
         add_tree(tar, FNOS / "ui", "ui")

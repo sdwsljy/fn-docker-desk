@@ -2,44 +2,40 @@
 # ============================================================
 # fn-docker-desk - 应用生命周期管理（start/stop/status）
 # ------------------------------------------------------------
+# 按飞牛 fnOS 官方规范：
+# - TRIM_APPDEST = /var/apps/fn-docker-desk/target  : 运行文件
+# - TRIM_PKGVAR  = /var/apps/fn-docker-desk/var     : 持久数据
+# - TRIM_SERVICE_PORT : manifest.service_port 分配的端口
 # install_type=root：生命周期脚本以 root 运行（需修改系统 Web 文件
-# /usr/trim/www、安装 systemd 服务）。Web 管理服务（web.py）也以
-# root 运行（需调用主脚本修改系统文件 + 直接访问 docker 命令）。
+# /usr/trim/www、安装 systemd 服务）。Web 管理服务也以 root 运行。
 # ============================================================
 set -euo pipefail
 
-DEST_DIR="/usr/fn-docker-desk"
-SVC_PORT="${TRIM_SERVICE_PORT:-5558}"
-WEB_LOG="/var/log/fn-docker-desk-web.log"
+# 官方环境变量：生命周期上下文始终注入；保留兜底避免手动调用时为空
+readonly APP_NAME="${TRIM_APPNAME:-fn-docker-desk}"
+readonly APP_DIR="/var/apps/${APP_NAME}"
+readonly PKG_APP="${TRIM_APPDEST:-${APP_DIR}/target}"
+readonly PKG_VAR="${TRIM_PKGVAR:-${APP_DIR}/var}"
+readonly SVC_PORT="${TRIM_SERVICE_PORT:-5558}"
+readonly WEB_LOG="/var/log/fn-docker-desk-web.log"
+readonly CLI_ENTRY="${PKG_APP}/bin/fn-docker-desk"
 
 # ---------------- 公共函数 ----------------
 
-# 从 TRIM_APPDEST 复制工具文件到稳定目录（幂等）
-sync_app_files() {
-    mkdir -p "$DEST_DIR"
-    if [ -d "${TRIM_APPDEST:-}" ]; then
-        cp -f "$TRIM_APPDEST"/fn-docker-desk.sh "$DEST_DIR/" 2>/dev/null || true
-        cp -f "$TRIM_APPDEST"/web.py "$DEST_DIR/" 2>/dev/null || true
-        cp -f "$TRIM_APPDEST"/desktop-inject.js "$DEST_DIR/" 2>/dev/null || true
-        chmod +x "$DEST_DIR/fn-docker-desk.sh" 2>/dev/null || true
-    fi
-}
-
 # 启动 Web 管理服务（以 root 运行）
 start_web_service() {
-    # 已运行则跳过
-    if pgrep -f "web.py --port ${SVC_PORT}" >/dev/null 2>&1; then
+    # 已运行则跳过（精确匹配 Python 进程，避免匹配到 pgrep 自身/bash 包装）
+    if ps -eo pid,args | awk '/python.*fn-docker-desk.*web\.py/ && $2 ~ /^python/' | grep -q " --port ${SVC_PORT} " 2>/dev/null || \
+       pgrep -f "web.py --port ${SVC_PORT}" >/dev/null 2>&1; then
         return 0
     fi
-    [ -f "$DEST_DIR/web.py" ] || return 0
+    [ -f "${PKG_APP}/web.py" ] || return 0
 
-    # 确保 web 日志可写
-    touch "$WEB_LOG" 2>/dev/null || true
-    chmod 644 "$WEB_LOG" 2>/dev/null || true
+    touch "${WEB_LOG}" 2>/dev/null || true
+    chmod 644 "${WEB_LOG}" 2>/dev/null || true
 
-    # 以 root 运行（web.py 需调用主脚本 require_root + 直接访问 docker）
-    nohup python3 -u "$DEST_DIR/web.py" --port "$SVC_PORT" \
-        >>"$WEB_LOG" 2>&1 &
+    nohup python3 -u "${PKG_APP}/web.py" --port "${SVC_PORT}" \
+        >>"${WEB_LOG}" 2>&1 &
     sleep 1
 }
 
@@ -47,17 +43,17 @@ start_web_service() {
 
 case $1 in
 start)
-    # 1. 同步工具文件到稳定目录
-    sync_app_files
-    # 2. 应用桌面注入（幂等；升级后自动从持久卷恢复配置）
-    if [ -f "$DEST_DIR/fn-docker-desk.sh" ]; then
-        bash "$DEST_DIR/fn-docker-desk.sh" apply --quiet || true
+    # 1. 应用桌面注入（幂等：首次注入 / 升级后恢复配置）
+    if [ -x "${CLI_ENTRY}" ]; then
+        bash "${CLI_ENTRY}" apply --quiet 2>/dev/null || true
     fi
-    # 3. 启动 Web 管理服务
+    # 2. 启动 Web 管理服务
     start_web_service
     exit 0
     ;;
 stop)
+    # 停止：优先精确匹配，再兜底 pkill
+    ps -eo pid,args | awk '/python.*fn-docker-desk.*web\.py/ && $2 ~ /^python/ && $0 ~ / --port '"${SVC_PORT}"' / {print $1}' | xargs -r kill 2>/dev/null || true
     pkill -f "web.py --port ${SVC_PORT}" 2>/dev/null || true
     exit 0
     ;;

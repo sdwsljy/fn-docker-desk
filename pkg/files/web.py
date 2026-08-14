@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-飞牛桌面图标 v1.1.6 - Web 管理界面
+飞牛桌面图标 v1.1.7 - Web 管理界面
 ================================
 把 Docker 容器应用一键添加到飞牛桌面的管理面板。
 
@@ -12,7 +12,7 @@ v0.4 新增：
 - 支持两种打开方式：飞牛桌面图标内部打开、外部浏览器通过端口访问
 
 纯 Python 标准库实现，无第三方依赖。通过调用主脚本
-(/usr/fn-docker-desk/fn-docker-desk.sh) 完成实际操作。
+（usr-local-linker 注册的 /usr/local/bin/fn-docker-desk，或 target/bin 入口）完成实际操作。
 
 用法:
     python3 web.py --port <应用内部端口>
@@ -40,13 +40,32 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-SCRIPT = "/usr/fn-docker-desk/fn-docker-desk.sh"
-CONF = "/usr/fn-docker-desk/icons.json"
-BACKUP_DIR = "/usr/fn-docker-desk/backup"
-ICON_DIR = "/usr/fn-docker-desk/icons"
+# 飞牛 fnOS 官方路径规范（始终通过 TRIM_* 环境变量访问）：
+#   TRIM_APPDEST = /var/apps/{appname}/target   : 运行文件（升级覆盖）
+#   TRIM_PKGVAR  = /var/apps/{appname}/var      : 持久数据（升级保留）
+#   TRIM_PKGETC  = /var/apps/{appname}/etc      : 配置目录
+# 当在非生命周期上下文（如 pytest、手动调式）中运行时，提供默认兜底。
+_APPNAME = "fn-docker-desk"
+_APP_ROOT = os.path.dirname(os.environ.get("TRIM_PKGMETA") or f"/var/apps/{_APPNAME}/meta")
+_PKG_APP = os.environ.get("TRIM_APPDEST") or os.path.join(_APP_ROOT, "target")
+_PKG_VAR = os.environ.get("TRIM_PKGVAR") or os.path.join(_APP_ROOT, "var")
+_PKG_ETC = os.environ.get("TRIM_PKGETC") or os.path.join(_APP_ROOT, "etc")
+
+# CLI 入口：优先用 usr-local-linker 注册的稳定命令（官方 /usr/local/bin），再兜底 target/bin
+SCRIPT = "/usr/local/bin/" + _APPNAME
+if not os.path.exists(SCRIPT):
+    SCRIPT = os.path.join(_PKG_APP, "bin", _APPNAME)
+
+# 用户持久数据（官方：TRIM_PKGVAR）
+CONF = os.path.join(_PKG_VAR, "icons.json")
+BACKUP_DIR = os.path.join(_PKG_VAR, "backup")
+ICON_DIR = os.path.join(_PKG_VAR, "icons")
+# 桌面端读取的发布配置（etc 下更规范）
+DEST_JSON = os.path.join(_PKG_ETC, "desktop.json")
+
 LOG_FILE = "/var/log/fn-docker-desk.log"
 DEFAULT_PORT = 5558
-APP_VERSION = "1.1.6"
+APP_VERSION = "1.1.17"
 
 # 写操作互斥锁：ThreadingHTTPServer 并发请求下保护 icons.json 读改写
 WRITE_LOCK = threading.Lock()
@@ -206,12 +225,12 @@ def get_nas_ip():
     return ""
 
 
-PAGE = r"""<!DOCTYPE html>
+PAGE_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>飞牛桌面图标 - 管理面板 v""" + APP_VERSION + """</title>
+<title>飞牛桌面图标 - 管理面板 v__APP_VERSION__</title>
 <style>
 :root {
   --bg0:#070a10; --bg1:#0a0f17; --panel:#0c131f;
@@ -336,7 +355,7 @@ body::before {
   <div class="term">
     <div class="term-bar">
       <div class="dots"><i></i><i></i><i></i></div>
-      <div class="term-title"><b>fn-docker-desk</b> · 桌面图标管理 <span class="ver">v1.1.6</span></div>
+      <div class="term-title"><b>fn-docker-desk</b> · 桌面图标管理 <span class="ver">v__APP_VERSION__</span></div>
       <div class="term-addr">NAS&nbsp;<b id="externalUrl">检测中…</b></div>
     </div>
     <div class="term-body">
@@ -451,8 +470,28 @@ body::before {
 let editingContainer = null;
 
 async function api(path, opts) {
-  const r = await fetch(path, opts);
-  return r.json();
+  let r;
+  try {
+    r = await fetch(path, opts);
+  } catch (e) {
+    return { ok: false, output: '网络请求失败: ' + e.message };
+  }
+  let text = '';
+  try {
+    text = await r.text();
+  } catch (e) {
+    return { ok: false, output: '读取响应失败: ' + e.message };
+  }
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    // 后端返回非 JSON（例如 Python 默认 500 HTML 错误页），打包成错误对象
+    const snippet = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200);
+    return {
+      ok: false,
+      output: '后端响应异常（HTTP ' + r.status + '）：' + (snippet || '空响应') + '，请查看 /var/log/fn-docker-desk.log'
+    };
+  }
 }
 
 function toast(msg, type) {
@@ -460,6 +499,26 @@ function toast(msg, type) {
   t.textContent = msg;
   t.className = 'show ' + (type || 'ok');
   setTimeout(() => { t.className = ''; }, 3200);
+}
+
+/**
+ * 从后端 output（含多行 [INFO]/[WARN]/[ERR] 混合日志）中抽取真正的失败原因：
+ * - 仅保留 [ERR]/[ERROR]/error:/Error:/Exception:/Traceback 等错误线索行
+ * - 剥离 [INFO]/[WARN] 成功性提示，避免「移除失败：[INFO] 已移除: 3 ...」这种误导
+ * - 没发现错误线索时，给用户清晰的兜底文案 + 日志路径
+ */
+function failReason(output, fallback) {
+  const raw = String(output == null ? '' : output);
+  if (!raw) return fallback || '后端返回异常，请查看 /var/log/fn-docker-desk.log';
+  const errLines = raw.split(/\r?\n/).filter(line => {
+    const s = line.trim();
+    if (!s) return false;
+    if (/^\[(ERR|ERROR|FATAL)\]/i.test(s)) return true;
+    if (/\b(error|exception|traceback|failed|failure|失败|拒绝|权限)\b/i.test(s)) return true;
+    return false;
+  });
+  if (errLines.length === 0) return fallback || '后端返回异常，请查看 /var/log/fn-docker-desk.log';
+  return errLines.slice(0, 3).join(' | ');
 }
 
 function esc(s) {
@@ -584,7 +643,7 @@ async function uploadIconFile() {
       body: JSON.stringify({ name: name, data: b64 })
     });
     if (rr.ok) { uploadedIcon = rr.rel; toast('图标已上传：' + rr.rel, 'ok'); }
-    else { toast('上传失败：' + (rr.output || ''), 'err'); uploadedIcon = ''; }
+    else { toast('上传失败：' + failReason(rr.output), 'err'); uploadedIcon = ''; }
   } catch (e) {
     toast('上传失败：' + e.message, 'err');
     uploadedIcon = '';
@@ -619,7 +678,7 @@ async function submitCustom() {
   const r = await api('/api/add-custom?' + q.toString(), { method: 'POST' });
   btn.disabled = false; btn.textContent = '添加到桌面';
   closeCustom();
-  toast(r.ok ? '已添加「' + name + '」，刷新浏览器查看桌面' : '添加失败：' + (r.output || ''), r.ok ? 'ok' : 'err');
+  toast(r.ok ? '已添加「' + name + '」，刷新浏览器查看桌面' : '添加失败：' + failReason(r.output), r.ok ? 'ok' : 'err');
   refreshAll();
 }
 
@@ -640,27 +699,27 @@ async function submitAdd() {
   const r = await api('/api/add?' + q.toString(), { method: 'POST' });
   btn.disabled = false; btn.textContent = '添加到桌面';
   closeModal();
-  toast(r.ok ? '已添加「' + (name || editingContainer) + '」，刷新浏览器查看桌面' : '添加失败：' + (r.output || ''), r.ok ? 'ok' : 'err');
+  toast(r.ok ? '已添加「' + (name || editingContainer) + '」，刷新浏览器查看桌面' : '添加失败：' + failReason(r.output), r.ok ? 'ok' : 'err');
   refreshAll();
 }
 
 async function removeIcon(seq) {
   if (!confirm('确认移除图标 #' + seq + ' ？')) return;
   const r = await api('/api/remove?id=' + seq, { method: 'POST' });
-  toast(r.ok ? '已移除' : '移除失败：' + (r.output || ''), r.ok ? 'ok' : 'err');
+  toast(r.ok ? '已移除' : '移除失败：' + failReason(r.output), r.ok ? 'ok' : 'err');
   refreshAll();
 }
 
 async function doApi(act, label) {
   const r = await api('/api/' + act, { method: 'POST' });
-  toast(r.ok ? label + '完成' : label + '失败：' + (r.output || ''), r.ok ? 'ok' : 'err');
+  toast(r.ok ? label + '完成' : label + '失败：' + failReason(r.output), r.ok ? 'ok' : 'err');
   refreshAll();
 }
 
 async function doRestore() {
   if (!confirm('确认一键还原？将移除全部桌面图标注入，并彻底清除应用内的图标设置（图标配置、持久卷备份、配置备份），恢复到原始飞牛系统桌面。还原后应用商城已装应用不受影响；重新启动本应用不会再生成本工具图标，需重新添加图标才会启用。')) return;
   const r = await api('/api/restore', { method: 'POST' });
-  toast(r.ok ? '已还原到原始飞牛桌面' : '还原失败：' + (r.output || ''), r.ok ? 'ok' : 'err');
+  toast(r.ok ? '已还原到原始飞牛桌面' : '还原失败：' + failReason(r.output), r.ok ? 'ok' : 'err');
   refreshAll();
 }
 
@@ -682,16 +741,34 @@ async function showLogs() {
 }
 
 async function refreshAll() {
-  let cs = {}, ic = {}, bk = {}, ip = {};
-  try { cs = await api('/api/containers'); } catch (e) { console.error('containers:', e); }
-  try { ic = await api('/api/icons'); } catch (e) { console.error('icons:', e); }
-  try { bk = await api('/api/backups'); } catch (e) { console.error('backups:', e); }
-  try { ip = await api('/api/ip'); } catch (e) { console.error('ip:', e); }
-  const nasIp = (ip && ip.ip) || '';
-  document.getElementById('externalUrl').textContent = nasIp ? ('http://' + nasIp + ':5558/') : '请从飞牛桌面图标打开';
-  renderContainers((cs && cs.list) || []);
-  renderIcons((ic && ic.list) || []);
-  renderBackups((bk && bk.list) || []);
+  try {
+    let cs = {}, ic = {}, bk = {}, ip = {};
+    try { cs = await api('/api/containers'); } catch (e) { console.error('containers:', e); }
+    try { ic = await api('/api/icons'); } catch (e) { console.error('icons:', e); }
+    try { bk = await api('/api/backups'); } catch (e) { console.error('backups:', e); }
+    try { ip = await api('/api/ip'); } catch (e) { console.error('ip:', e); }
+    const nasIp = (ip && ip.ip) || '';
+    document.getElementById('externalUrl').textContent = nasIp ? ('http://' + nasIp + ':5558/') : '请从飞牛桌面图标打开';
+    try { renderContainers((cs && cs.list) || []); } catch (e) {
+      document.getElementById('containers').innerHTML = '<div class="empty" style="color:var(--err)">渲染失败: ' + esc(e.message) + '</div>';
+    }
+    try { renderIcons((ic && ic.list) || []); } catch (e) {
+      document.getElementById('icons').innerHTML = '<div class="empty" style="color:var(--err)">渲染失败: ' + esc(e.message) + '</div>';
+    }
+    try { renderBackups((bk && bk.list) || []); } catch (e) {
+      document.getElementById('backups').innerHTML = '<div class="empty" style="color:var(--err)">渲染失败: ' + esc(e.message) + '</div>';
+    }
+  } catch (e) {
+    // 全局兜底：refreshAll 任何致命异常都替换「加载中」提示
+    console.error('refreshAll fatal:', e);
+    const boxes = ['containers', 'icons', 'backups'];
+    boxes.forEach(id => {
+      const el = document.getElementById(id);
+      if (el && el.querySelector('.empty') && el.querySelector('.empty').textContent.indexOf('加载中') !== -1) {
+        el.innerHTML = '<div class="empty" style="color:var(--err)">加载失败: ' + esc(e.message) + '<br>请查看 /var/log/fn-docker-desk.log</div>';
+      }
+    });
+  }
 }
 
 // 事件委托：data-add（添加到桌面）/ data-rm（移除图标），避免内联 onclick 转义问题
@@ -707,6 +784,8 @@ refreshAll();
 </body>
 </html>
 """
+
+PAGE = PAGE_TEMPLATE.replace("__APP_VERSION__", APP_VERSION)
 
 
 GATEWAY_PAGE = r"""<!DOCTYPE html>
@@ -753,7 +832,45 @@ window.onload = go;
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "fn-docker-desk/1.1.6"
+    server_version = "fn-docker-desk/" + APP_VERSION
+
+    def _send_error_json(self, code, message):
+        """任何未捕获异常都返回 JSON，避免前端 r.json() 崩溃"""
+        try:
+            body = json.dumps({"ok": False, "output": message}, ensure_ascii=False)
+            self._send(code, body)
+        except Exception:  # noqa: BLE001
+            # 最后兜底：即使 headers 已发送等极端情况，也尝试写日志
+            try:
+                with open(LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write("[web] 致命错误，无法发送响应: %s\n" % message)
+            except Exception:
+                pass
+
+    def handle_error(self, request, client_address):
+        """重写 BaseHTTPRequestHandler.handle_error：返回 JSON 500 而非默认 HTML 错误页
+
+        BaseHTTPRequestHandler 在 do_GET/do_POST 抛异常时会调用本方法，
+        默认实现是输出一堆 HTML 堆栈，导致前端 r.json() 抛 SyntaxError，
+        整个 refreshAll() 被异常吞噬后界面永远卡在「加载中」。
+        这里改为：写日志 + 发送 JSON 格式的 500 响应。
+        """
+        import traceback
+        tb = traceback.format_exc()
+        # 记录到本地日志文件（便于排查）
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write("[web] HTTP 处理异常 @%s:\n%s\n" % (client_address, tb[-2000:]))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            # 截取对用户友好的最后一行异常描述
+            lines = [l for l in tb.splitlines() if l.strip()][-2:]
+            friendly = " | ".join(lines) if lines else "未知异常"
+            self._send_error_json(500, "服务器内部错误: " + friendly[:300])
+        except Exception:  # noqa: BLE001
+            # headers 可能已发送或连接已断，静默失败
+            pass
 
     def _send(self, code, body, ctype="application/json; charset=utf-8", cors=False):
         if isinstance(body, str):
@@ -779,7 +896,61 @@ class Handler(BaseHTTPRequestHandler):
     def send_html(self, html):
         self._send(200, html, "text/html; charset=utf-8")
 
+    def _check_origin(self):
+        """CSRF 防护：非 GET 请求必须同源（Host 与 Origin/Referer 主机名一致即可）
+
+        - 放宽端口比较：飞牛桌面主站点运行在 :80/:443，而本管理面板运行在 manifest 的
+          service_port（默认 5558），从桌面端以 iframe/新窗口打开面板后发起的 XHR
+          Origin 与 Host 端口必然不同；严格匹配 netloc 会误杀合法调用。
+        - 因此改为：仅比较主机名（hostname 部分，不含端口/用户/密码）。
+        - Origin/Referer 缺失时放行（兼容非浏览器或老版本客户端；现代浏览器跨站
+          POST 会携带 Origin，无法绕过）。
+        - manifest 已声明 disable_authorization_path=true（内网工具无鉴权），
+          因此同源校验是阻止跨站驱动式调用的关键防线。
+        """
+        headers = getattr(self, "headers", None)
+        if not headers:
+            return True
+        host_header = headers.get("Host", "")
+        if not host_header:
+            return True
+        src = headers.get("Origin") or headers.get("Referer") or ""
+        if not src:
+            return True
+        try:
+            host_h = urlparse("http://" + host_header).hostname or ""
+            host_s = urlparse(src).hostname or ""
+        except Exception:  # noqa: BLE001
+            return False
+        # 主机名一致即放行（忽略端口差异与 IPv4/IPv6 格式差异：urlparse hostname 统一小写）
+        return host_h and host_s and host_h.lower() == host_s.lower()
+
     def do_GET(self):
+        """GET 统一入口：外层全局 try-except 兜底，任何异常都返回 JSON 500。
+
+        相比重写 handle_error，在方法内部捕获有两个优势：
+        1) 保证 headers 尚未发送时构造完整响应，避免半写导致客户端 RST；
+        2) 异常发生时无需依赖 BaseHTTPRequestHandler 的 handle_error 调用时机，
+           不同 Python 版本该时机略有差异。
+        """
+        import traceback
+        try:
+            self._do_GET_inner()
+        except Exception as e:  # noqa: BLE001
+            tb = traceback.format_exc()
+            try:
+                with open(LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write("[web] do_GET 异常 %s: %s\n%s\n" % (self.path, e, tb[-1500:]))
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                lines = [l for l in tb.splitlines() if l.strip()][-2:]
+                friendly = " | ".join(lines) if lines else str(e)
+                self._send_error_json(500, "GET 失败: " + friendly[:300])
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _do_GET_inner(self):
         u = urlparse(self.path)
         if u.path in ("/", "/index.html"):
             self.send_html(PAGE)
@@ -829,17 +1000,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "output": str(e)})
 
     def handle_upload(self):
-        """接收 base64 PNG，保存到 /usr/fn-docker-desk/icons/（文件名白名单防穿越）"""
+        """接收 base64 PNG，保存到 TRIM_PKGVAR/icons/（文件名白名单防穿越）"""
         try:
             length = int(self.headers.get("Content-Length") or 0)
             if length <= 0 or length > 3 * 1024 * 1024:
-                self.send_json({"ok": False, "output": "请求体为空或超过 3MB"})
+                self._send(400, json.dumps({"ok": False, "output": "请求体为空或超过 3MB"}, ensure_ascii=False))
                 return
             body = self.rfile.read(length).decode("utf-8", "replace")
             data = json.loads(body)
             name = str(data.get("name") or "icon")
             if not re.match(r"^[a-zA-Z0-9_-]{1,64}$", name):
-                self.send_json({"ok": False, "output": "文件名不合法"})
+                self._send(400, json.dumps({"ok": False, "output": "文件名不合法"}, ensure_ascii=False))
                 return
             b64 = str(data.get("data") or "")
             raw = base64.b64decode(b64)
@@ -865,6 +1036,41 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "output": "上传失败: %s" % e})
 
     def do_POST(self):
+        """POST 统一入口：外层全局 try-except 兜底，任何异常都返回 JSON 500。"""
+        import traceback
+        try:
+            self._do_POST_inner()
+        except Exception as e:  # noqa: BLE001
+            tb = traceback.format_exc()
+            try:
+                with open(LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write("[web] do_POST 异常 %s: %s\n%s\n" % (self.path, e, tb[-1500:]))
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                lines = [l for l in tb.splitlines() if l.strip()][-2:]
+                friendly = " | ".join(lines) if lines else str(e)
+                self._send_error_json(500, "POST 失败: " + friendly[:300])
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _do_POST_inner(self):
+        # CSRF 防护：写接口必须同源（manifest disable_authorization_path=true，
+        # 内网工具无鉴权，同源校验是阻止跨站 POST 调用 add/remove/restore 等的关键）
+        if not self._check_origin():
+            self._send(403, json.dumps({"ok": False, "output": "跨站请求已拦截"}, ensure_ascii=False))
+            return
+        # 全局请求体大小限制（10MB），防止恶意大 body 占用资源
+        # /api/upload 内部另有 3MB 更严格限制
+        headers = getattr(self, "headers", None)
+        if headers:
+            try:
+                length = int(headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                length = 0
+            if length > 10 * 1024 * 1024:
+                self._send(400, json.dumps({"ok": False, "output": "请求体超过 10MB 限制"}, ensure_ascii=False))
+                return
         u = urlparse(self.path)
         qs = parse_qs(u.query)
         if u.path == "/api/upload":
