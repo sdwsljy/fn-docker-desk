@@ -16,9 +16,9 @@ env/
 .DS_Store
 Thumbs.db
 
-# Local build scratch output
+# Local build scratch output (release fpk assets are hosted on GitHub Releases, not committed)
 build/
 tmp/
-
-# Keep release packages in dist/
-!dist/*.fpk
+dist/
+*.json.tmp
+_ref*.*
