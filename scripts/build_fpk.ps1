@@ -1,7 +1,5 @@
-# Build fn-docker-desk .fpk package using PowerShell + manual USTAR tar construction
-# Equivalent to scripts/build_fpk.py
-# Windows PowerShell 5.1 compatible (no TarFile class available)
-
+# Build fn-docker-desk .fpk — matches Python tarfile.PAX_FORMAT + gzip (flags=0x08|FNAME,XFL=0x02,OS=255)
+# Reference: v1.1.17 .fpk actually installed & running on fnOS NAS
 $ErrorActionPreference = "Stop"
 
 $ROOT = Resolve-Path "$PSScriptRoot\.."
@@ -10,196 +8,357 @@ $FNOS = Join-Path $PKG "fnos"
 $FILES = Join-Path $PKG "files"
 $DIST = Join-Path $ROOT "dist"
 
-# Read version from manifest
-$manifest = Get-Content (Join-Path $FNOS "manifest") -Encoding UTF8
-$version = ($manifest | Where-Object { $_ -match '^\s*version\s*=' } | ForEach-Object { ($_ -split '=', 2)[1].Trim() }) | Select-Object -First 1
+# ---- version ----
+$manifestLines = Get-Content (Join-Path $FNOS "manifest") -Encoding UTF8
+$version = $null
+foreach ($line in $manifestLines) {
+    if ($line -match '^\s*version\s*=\s*(.+)$') { $version = $matches[1].Trim(); break }
+}
 if (-not $version) { throw "version not found in pkg/fnos/manifest" }
-Write-Host "Building fn-docker-desk v$version"
-
+$fpkBasename = "fn-docker-desk_${version}_all.fpk"
+Write-Host "Building $fpkBasename"
 if (-not (Test-Path $DIST)) { New-Item -ItemType Directory -Path $DIST | Out-Null }
 
-# ---------- USTAR tar helpers ----------
-# Returns a 512-byte header for a single file entry.
-function New-TarHeader {
+# ============================================================
+# Section 1. CRC32 + Custom GZip writer (match Python gzip header)
+# ============================================================
+# Standard CRC-32 (IEEE polynomial 0xEDB88320, reflected) — lookup table
+$script:Crc32Table = New-Object uint32[] 256
+for ($i = 0; $i -lt 256; $i++) {
+    [uint32]$c = $i
+    for ($k = 0; $k -lt 8; $k++) {
+        if ($c -band 1) { $c = (0xEDB88320 -bxor ($c -shr 1)) }
+        else { $c = $c -shr 1 }
+    }
+    $script:Crc32Table[$i] = $c
+}
+function Update-Crc32([uint32]$crc, [byte[]]$buf, [int]$offset, [int]$count) {
+    [uint32]$c = $crc -bxor 0xFFFFFFFF
+    for ($i = 0; $i -lt $count; $i++) {
+        $c = $script:Crc32Table[($c -bxor $buf[$offset+$i]) -band 0xFF] -bxor ($c -shr 8)
+    }
+    return ($c -bxor 0xFFFFFFFF)
+}
+
+# Produce GZip bytes exactly matching Python gzip.GzipFile(fname, compresslevel=9):
+#   header: magic(2)+CM(1)+FLG(1)=0x08+MTIME(4 LE)+XFL(1)=0x02+OS(1)=255 + FNAME (ASCIIZ)
+#   body:   raw deflate stream (no zlib wrapper)
+#   trailer: CRC32(4 LE) + ISIZE(4 LE) = originalSize mod 2^32
+function Compress-GzipCustom {
     param(
-        [string]$Name,     # arcname (relative path, forward slashes)
-        [int64]$Size,
-        [int]$Mode = 420,  # 0o644
-        [int64]$Mtime = 0,
-        [bool]$IsExec = $false
+        [byte[]]$OriginalBytes,
+        [string]$Fname,          # original filename (FNAME field)
+        [uint32]$Mtime = 0       # Unix timestamp; 0 = current time
     )
-    $realMode = if ($IsExec) { 493 } else { $Mode }  # 0o755 vs 0o644
-
-    $header = New-Object byte[] 512
-    # helper: convert int64 to octal string (PowerShell 5.1 has no :o format)
-    function ConvertTo-Octal([int64]$val) {
-        if ($val -eq 0) { return '0' }
-        $s = ''
-        $v = $val
-        while ($v -gt 0) {
-            $s = [string]($v % 8) + $s
-            $v = [math]::Floor($v / 8)
-        }
-        return $s
+    if ($Mtime -eq 0) {
+        $epoch = New-Object DateTimeOffset(1970,1,1,0,0,0,[TimeSpan]::Zero)
+        $Mtime = [uint32]([Math]::Floor([DateTimeOffset]::UtcNow.Subtract($epoch).TotalSeconds))
     }
-    # helper: write octal-padded ASCII field
-    function Set-OctalField([byte[]]$buf, [int]$offset, [int]$len, [int64]$val) {
-        # octal string, right-padded with NUL, with one trailing space before NULs (classic ustar)
-        $s = ConvertTo-Octal $val
-        # field layout: <spaces? no> <octal digits> <NUL> OR <octal digits> <space> <NULs>
-        # Standard: digits followed by a NUL (or space + NUL). Use digits + NUL, zero-padded on left.
-        $maxDigits = $len - 1  # leave 1 byte for NUL
-        if ($s.Length -gt $maxDigits) { $s = $s.Substring($s.Length - $maxDigits) }
-        $padded = $s.PadLeft($maxDigits, '0')
-        for ($i = 0; $i -lt $maxDigits; $i++) {
-            $buf[$offset + $i] = [byte][char]$padded[$i]
-        }
-        $buf[$offset + $maxDigits] = 0  # NUL terminator
-    }
-    function Set-StringField([byte[]]$buf, [int]$offset, [int]$len, [string]$s) {
-        $bytes = [System.Text.Encoding]::ASCII.GetBytes($s)
-        $copyLen = [Math]::Min($bytes.Length, $len)
-        [Array]::Copy($bytes, 0, $buf, $offset, $copyLen)
-        # remaining bytes already 0 (header initialized with zeros)
-    }
+    $fnameBytes = [System.Text.Encoding]::ASCII.GetBytes($Fname)
 
-    # 0-99: name
-    Set-StringField $header 0 100 $Name
-    # 100-107: mode (octal, e.g. '0000644\0')
-    Set-OctalField $header 100 8 $realMode
-    # 108-115: uid (0)
-    Set-OctalField $header 108 8 0
-    # 116-123: gid (0)
-    Set-OctalField $header 116 8 0
-    # 124-135: size (octal)
-    Set-OctalField $header 124 12 $Size
-    # 136-147: mtime (octal)
-    Set-OctalField $header 136 12 $Mtime
-    # 148-155: checksum (compute below; first fill with spaces)
-    for ($i = 148; $i -lt 156; $i++) { $header[$i] = [byte][char]' ' }
-    # 156: typeflag ('0' = regular file)
-    $header[156] = [byte][char]'0'
-    # 157-256: linkname (empty)
-    # 257-262: magic 'ustar\0'
-    $magic = [System.Text.Encoding]::ASCII.GetBytes('ustar')
-    [Array]::Copy($magic, 0, $header, 257, 5)
-    $header[262] = 0
-    # 263-264: version '00'
-    $header[263] = [byte][char]'0'
-    $header[264] = [byte][char]'0'
-    # 265-296: uname ('root')
-    Set-StringField $header 265 32 'root'
-    # 297-328: gname ('root')
-    Set-StringField $header 297 32 'root'
-    # 329-336: devmajor
-    # 337-344: devminor
-    # 345-499: prefix
-    # 500-511: padding
-    # Compute checksum: sum of all bytes (checksum field treated as 8 spaces, already set)
-    $sum = 0
-    foreach ($b in $header) { $sum += $b }
-    # Write checksum as 6-digit octal + NUL + space (common format)
-    $chk = (ConvertTo-Octal $sum).PadLeft(6, '0')
-    $chkBytes = [System.Text.Encoding]::ASCII.GetBytes($chk)
-    [Array]::Copy($chkBytes, 0, $header, 148, 6)
-    $header[154] = 0
-    $header[155] = [byte][char]' '
-    return $header
-}
+    # ----------- Build header -----------
+    $headerSize = 10 + $fnameBytes.Length + 1  # 10 fixed + fname + '\0'
+    $header = New-Object byte[] $headerSize
+    $header[0] = 0x1F; $header[1] = 0x8B       # magic
+    $header[2] = 0x08                           # CM = deflate
+    $header[3] = 0x08                           # FLG = FNAME only
+    [Buffer]::BlockCopy([BitConverter]::GetBytes([uint32]$Mtime), 0, $header, 4, 4)  # MTIME LE
+    $header[8] = 0x02                           # XFL = best compression
+    $header[9] = 0xFF                           # OS = unknown
+    [Array]::Copy($fnameBytes, 0, $header, 10, $fnameBytes.Length)
+    $header[10 + $fnameBytes.Length] = 0
 
-# Pad content to 512-byte boundary
-function Get-PaddedContent([byte[]]$data) {
-    $mod = $data.Length % 512
-    if ($mod -eq 0) { return $data }
-    $padded = New-Object byte[] ($data.Length + (512 - $mod))
-    [Array]::Copy($data, $padded, $data.Length)
-    return $padded
-}
+    # ----------- Body: raw deflate + CRC -----------
+    $crc = [uint32]0
+    $crc = Update-Crc32 $crc $OriginalBytes 0 $OriginalBytes.Length
+    $isize = [uint32]($OriginalBytes.Length -band 0xFFFFFFFF)
 
-# Build a tar (uncompressed) from a list of {Path, ArcName, IsExec}
-function Build-Tar {
-    param([array]$Entries)
-    $ms = New-Object System.IO.MemoryStream
-    foreach ($e in $Entries) {
-        $bytes = [System.IO.File]::ReadAllBytes($e.Path)
-        $hdr = New-TarHeader -Name $e.ArcName -Size $bytes.Length -IsExec $e.IsExec
-        $ms.Write($hdr, 0, $hdr.Length)
-        $padded = Get-PaddedContent $bytes
-        $ms.Write($padded, 0, $padded.Length)
-    }
-    # End-of-archive: two 512-byte zero blocks
-    $zeros = New-Object byte[] 1024
-    $ms.Write($zeros, 0, 1024)
-    return $ms.ToArray()
-}
-
-# GZip a byte array
-function Compress-Gzip([byte[]]$data) {
-    $ms = New-Object System.IO.MemoryStream
-    $gs = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionLevel]::Optimal)
-    $gs.Write($data, 0, $data.Length)
-    $gs.Close()
-    $result = $ms.ToArray()
-    $ms.Close()
+    $msBody = New-Object System.IO.MemoryStream
+    # Write header first to output stream
+    $msOutput = New-Object System.IO.MemoryStream
+    $msOutput.Write($header, 0, $header.Length)
+    # Deflate: use Optimal. IMPORTANT: DeflateStream must leave stream open so we can append trailer.
+    # .NET DeflateStream with leaveOpen = true.
+    $ds = New-Object System.IO.Compression.DeflateStream($msOutput, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+    $ds.Write($OriginalBytes, 0, $OriginalBytes.Length)
+    $ds.Close()
+    # Trailer: CRC32 LE, ISIZE LE
+    $trailer = New-Object byte[] 8
+    [Buffer]::BlockCopy([BitConverter]::GetBytes($crc), 0, $trailer, 0, 4)
+    [Buffer]::BlockCopy([BitConverter]::GetBytes($isize), 0, $trailer, 4, 4)
+    $msOutput.Write($trailer, 0, 8)
+    $result = $msOutput.ToArray()
+    $msOutput.Close(); $msBody.Close()
     return $result
 }
 
-# Collect files from a directory tree, returning array of {Path, ArcName, IsExec}
-function Get-TreeEntries {
-    param([string]$BaseDir, [string]$ArcPrefix, [bool]$DefaultExec = $false)
-    $entries = @()
-    $baseFull = (Get-Item $BaseDir).FullName
-    $files = Get-ChildItem -Path $BaseDir -Recurse -File | Where-Object { $_.FullName -notmatch '__pycache__' }
-    foreach ($f in $files) {
-        $rel = $f.FullName.Substring($baseFull.Length + 1) -replace '\\','/'
-        $arcName = if ($ArcPrefix) { "$ArcPrefix/$rel" } else { $rel }
-        # Detect shebang
-        $first2 = $null
-        try {
-            $fs = [System.IO.File]::OpenRead($f.FullName)
-            $buf = New-Object byte[] 2
-            $read = $fs.Read($buf, 0, 2)
-            $fs.Close()
-            if ($read -ge 2 -and $buf[0] -eq 0x23 -and $buf[1] -eq 0x21) {
-                $first2 = $buf
-            }
-        } catch {}
-        $isExec = $DefaultExec -or ($first2 -ne $null)
-        $entries += [pscustomobject]@{ Path = $f.FullName; ArcName = $arcName; IsExec = $isExec }
+# ============================================================
+# Section 2. Tar helpers: build via tar.exe --format=pax, then patch mode/checksum
+# ============================================================
+function ConvertTo-Octal([int64]$val) {
+    if ($val -eq 0) { return '0' }
+    $s = ''; $v = $val
+    while ($v -gt 0) { $s = [string]($v % 8) + $s; $v = [math]::Floor($v / 8) }
+    return $s
+}
+function Set-OctalField([byte[]]$buf, [int]$offset, [int]$len, [int64]$val) {
+    $s = ConvertTo-Octal $val
+    $maxDigits = $len - 1
+    if ($s.Length -gt $maxDigits) { $s = $s.Substring($s.Length - $maxDigits) }
+    $padded = $s.PadLeft($maxDigits, '0')
+    for ($i = 0; $i -lt $maxDigits; $i++) { $buf[$offset + $i] = [byte][char]$padded[$i] }
+    $buf[$offset + $maxDigits] = 0
+}
+function Get-TarChecksum([byte[]]$hdr512) {
+    $sum = 0
+    for ($i = 0; $i -lt 512; $i++) {
+        $sum += if ($i -ge 148 -and $i -lt 156) { 0x20 } else { $hdr512[$i] }
     }
-    return $entries
+    return $sum
 }
 
-# ---------- Build app.tgz ----------
-$appEntries = @()
-$appEntries += [pscustomobject]@{ Path = Join-Path $FILES "fn-docker-desk.sh"; ArcName = "bin/fn-docker-desk"; IsExec = $true }
-$appEntries += [pscustomobject]@{ Path = Join-Path $FILES "web.py"; ArcName = "web.py"; IsExec = $true }
-$appEntries += [pscustomobject]@{ Path = Join-Path $FILES "desktop-inject.js"; ArcName = "desktop-inject.js"; IsExec = $false }
-$appEntries += Get-TreeEntries (Join-Path $FNOS "ui") "ui" $false
+# Add single file to tar using tar.exe --format=pax (ustar magic + PaxHeader 'x' before each entry)
+# -cf on first call, -rf on subsequent (single entry per call for order control)
+function Add-TarEntry {
+    param(
+        [string]$TarPath,
+        [string]$BaseDir,
+        [string]$RelPath,
+        [bool]$IsFirst
+    )
+    $op = if ($IsFirst) { '-c' } else { '-r' }
+    & tar "${op}f" $TarPath --format=pax -C $BaseDir $RelPath 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "tar ${op}f --format=pax failed for '$RelPath' (exit=$LASTEXITCODE)" }
+}
 
-$appTar = Build-Tar $appEntries
-$appTgzBytes = Compress-Gzip $appTar
-Write-Host ("app.tgz: {0} entries, {1} bytes" -f $appEntries.Count, $appTgzBytes.Length)
+# Walk a directory, return files sorted by forward-slash relative arc name
+function Get-AlphaEntries([string]$DirUnderBase, [string]$Stage) {
+    $target = Join-Path $Stage $DirUnderBase
+    if (-not (Test-Path $target)) { return @() }
+    $stageFull = (Get-Item $Stage).FullName
+    $files = Get-ChildItem -Path $target -Recurse -File
+    $list = foreach ($f in $files) {
+        $relNative = $f.FullName.Substring($stageFull.Length + 1)
+        $relArc = $relNative -replace '\\', '/'
+        [pscustomobject]@{ RelNative = $relNative; Arc = $relArc }
+    }
+    return ($list | Sort-Object Arc)
+}
 
-# Write app.tgz to a temp file (so we can re-read as bytes for the fpk tar)
-$appTgzPath = Join-Path $env:TEMP ("app." + [System.Guid]::NewGuid().ToString("N") + ".tgz")
+# Patch PaxHeader entries produced by bsdtar --format=pax to match Python tarfile.PAX_FORMAT
+# convention that fnOS expects: name='././@PaxHeader', mode=0, mtime=0, payload=single line "N mtime=<epoch.frac>\n"
+function Patch-PaxHeaders {
+    param([byte[]]$TarBytes)
+    function Get-Name([byte[]]$b, [int]$off) {
+        $len = 0
+        for ($i = 0; $i -lt 100; $i++) { if ($b[$off+$i] -eq 0) { $len = $i; break } }
+        [System.Text.Encoding]::ASCII.GetString($b, $off, $len)
+    }
+    function Get-Size([byte[]]$b, [int]$off) {
+        $raw = [System.Text.Encoding]::ASCII.GetString($b, ($off+124), 12)
+        return [Convert]::ToInt64(($raw -replace '\0','').Trim(), 8)
+    }
+    function Is-Zero([byte[]]$b, [int]$off) {
+        for ($i = 0; $i -lt 512; $i++) { if ($b[$off+$i] -ne 0) { return $false } }
+        return $true
+    }
+    # Build a PAX one-line mtime record. Length-prefix includes length-digits count itself.
+    # E.g. lenStr="27" + " " + "mtime=1786650251.565991\n" = total 27 bytes
+    function Build-PaxMtime([string]$mtimeVal) {
+        $body = "mtime=$mtimeVal`n"
+        # Try length from 1 digit up to 5: record len = d (digits) + 1 (space) + body.Length
+        for ($d = 1; $d -lt 6; $d++) {
+            $totalLen = $d + 1 + $body.Length
+            $lenStr = [string]$totalLen
+            if ($lenStr.Length -ne $d) { continue }  # need more/less digits
+            $candidate = "$lenStr $body"
+            if ($candidate.Length -eq $totalLen) {
+                return [System.Text.Encoding]::ASCII.GetBytes($candidate)
+            }
+        }
+        # fallback
+        $totalLen = 2 + $body.Length
+        return [System.Text.Encoding]::ASCII.GetBytes("$([string]$totalLen) $body")
+    }
+
+    $offset = 0
+    while ($offset + 511 -lt $TarBytes.Length) {
+        if (Is-Zero $TarBytes $offset) { break }
+        $name = Get-Name $TarBytes $offset
+        $typeflag = [char]$TarBytes[$offset+156]
+        $sizeVal = Get-Size $TarBytes $offset
+        $dataBlocks = [math]::Ceiling($sizeVal / 512)
+
+        if ($typeflag -eq 'x') {
+            # --- 1. Extract mtime from bsdtar payload (find last 'mtime=' line)
+            $dataOff = $offset + 512
+            $paxRaw = if ($sizeVal -gt 0) { [System.Text.Encoding]::ASCII.GetString($TarBytes, $dataOff, [Math]::Min([int]$sizeVal, 512)) } else { '' }
+            $mtimeVal = "0"
+            foreach ($line in ($paxRaw -split "`n")) {
+                if ($line -match '^\d+ mtime=(.+)\s*$') { $mtimeVal = $matches[1]; break }
+            }
+            $newPayload = Build-PaxMtime $mtimeVal
+            $newSize = $newPayload.Length
+
+            # --- 2. Patch name field (0-99): '././@PaxHeader' + zeros
+            for ($i = 0; $i -lt 100; $i++) { $TarBytes[$offset+$i] = 0 }
+            $nm = [System.Text.Encoding]::ASCII.GetBytes('././@PaxHeader')
+            [Array]::Copy($nm, 0, $TarBytes, $offset, $nm.Length)
+
+            # --- 3. Patch mode to '0000000 '
+            Set-OctalField $TarBytes ($offset+100) 8 0
+
+            # --- 4. Patch size
+            Set-OctalField $TarBytes ($offset+124) 12 $newSize
+
+            # --- 5. Patch mtime field to '00000000000 ' (epoch)
+            Set-OctalField $TarBytes ($offset+136) 12 0
+
+            # --- 6. Zero data block, write new payload
+            for ($i = 0; $i -lt ($dataBlocks*512); $i++) { $TarBytes[$dataOff+$i] = 0 }
+            [Array]::Copy($newPayload, 0, $TarBytes, $dataOff, $newPayload.Length)
+
+            # --- 7. Recalculate checksum
+            for ($ci = 148; $ci -lt 156; $ci++) { $TarBytes[$offset+$ci] = 0x20 }
+            $hdr = New-Object byte[] 512
+            [Array]::Copy($TarBytes, $offset, $hdr, 0, 512)
+            $chk = Get-TarChecksum $hdr
+            $ch = (ConvertTo-Octal $chk).PadLeft(6, '0')
+            for ($ci = 0; $ci -lt 6; $ci++) { $TarBytes[$offset+148+$ci] = [byte][char]$ch[$ci] }
+            $TarBytes[$offset+154] = 0x00
+            $TarBytes[$offset+155] = 0x20
+
+            $dataBlocks = [math]::Ceiling($newSize / 512)
+        }
+        $offset += 512 + $dataBlocks * 512
+    }
+}
+
+# Patch tar bytes: only FILE entries (type='0') get mode corrected.
+# Exec list (0755): bin/fn-docker-desk, web.py, ui/index.cgi, anything under cmd/
+# Non-exec (0644): manifest, ICONs, app.tgz, config/*, desktop-inject.js, ui/* except index.cgi
+function Patch-TarModes {
+    param([byte[]]$TarBytes, [string]$ExecRegex)
+
+    function Get-Name([byte[]]$b, [int]$off) {
+        $len = 0
+        for ($i = 0; $i -lt 100; $i++) { if ($b[$off+$i] -eq 0) { $len = $i; break } }
+        [System.Text.Encoding]::ASCII.GetString($b, $off, $len)
+    }
+    function Get-Size([byte[]]$b, [int]$off) {
+        $raw = [System.Text.Encoding]::ASCII.GetString($b, ($off+124), 12)
+        return [Convert]::ToInt64(($raw -replace '\0','').Trim(), 8)
+    }
+    function Is-Zero([byte[]]$b, [int]$off) {
+        for ($i = 0; $i -lt 512; $i++) { if ($b[$off+$i] -ne 0) { return $false } }
+        return $true
+    }
+
+    $offset = 0
+    while ($offset + 511 -lt $TarBytes.Length) {
+        if (Is-Zero $TarBytes $offset) { break }
+        $name = Get-Name $TarBytes $offset
+        $typeflag = [char]$TarBytes[$offset+156]
+        $sizeVal = Get-Size $TarBytes $offset
+        $dataBlocks = [math]::Ceiling($sizeVal / 512)
+
+        if ($typeflag -eq '0') {
+            # regular file entry — patch mode
+            $isExec = [bool]($name -match $ExecRegex)
+            $mode = if ($isExec) { 493 } else { 420 }   # 0o755 / 0o644
+            Set-OctalField $TarBytes ($offset+100) 8 $mode
+
+            # Recalculate header checksum
+            for ($ci = 148; $ci -lt 156; $ci++) { $TarBytes[$offset+$ci] = 0x20 }
+            $hdr = New-Object byte[] 512
+            [Array]::Copy($TarBytes, $offset, $hdr, 0, 512)
+            $chk = Get-TarChecksum $hdr
+            $ch = (ConvertTo-Octal $chk).PadLeft(6, '0')
+            for ($ci = 0; $ci -lt 6; $ci++) { $TarBytes[$offset+148+$ci] = [byte][char]$ch[$ci] }
+            $TarBytes[$offset+154] = 0x00
+            $TarBytes[$offset+155] = 0x20
+        }
+        # else: type='x' (PaxHeader) → skip
+        $offset += 512 + $dataBlocks * 512
+    }
+}
+
+# ============================================================
+# Section 3. Build inner app.tgz
+# ============================================================
+$appStage = Join-Path $env:TEMP ("fn-app." + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path (Join-Path $appStage "bin") -Force | Out-Null
+Copy-Item (Join-Path $FILES "fn-docker-desk.sh") (Join-Path $appStage "bin\fn-docker-desk") -Force
+Copy-Item (Join-Path $FILES "web.py") (Join-Path $appStage "web.py") -Force
+Copy-Item (Join-Path $FILES "desktop-inject.js") (Join-Path $appStage "desktop-inject.js") -Force
+if (Test-Path (Join-Path $FNOS "ui")) { Copy-Item (Join-Path $FNOS "ui") (Join-Path $appStage "ui") -Recurse -Force }
+
+$appTarPath = Join-Path $env:TEMP ("fn-app-tar." + [guid]::NewGuid().ToString("N") + ".tar")
+try {
+    # Order: bin/fn-docker-desk → web.py → desktop-inject.js → ui/** (alpha)
+    $ordered = @()
+    $ordered += [pscustomobject]@{ RelNative = "bin\fn-docker-desk"; Arc = "bin/fn-docker-desk" }
+    $ordered += [pscustomobject]@{ RelNative = "web.py"; Arc = "web.py" }
+    $ordered += [pscustomobject]@{ RelNative = "desktop-inject.js"; Arc = "desktop-inject.js" }
+    $ordered += @(Get-AlphaEntries "ui" $appStage)
+    for ($i = 0; $i -lt $ordered.Count; $i++) {
+        Add-TarEntry -TarPath $appTarPath -BaseDir $appStage -RelPath $ordered[$i].RelNative -IsFirst ($i -eq 0)
+    }
+    $appTarBytes = [System.IO.File]::ReadAllBytes($appTarPath)
+} finally {
+    Remove-Item $appTarPath -Force -ErrorAction SilentlyContinue
+    Remove-Item $appStage -Recurse -Force -ErrorAction SilentlyContinue
+}
+# Patch PaxHeaders, then patch modes (exec: bin/fn-docker-desk, web.py, ui/index.cgi)
+Patch-PaxHeaders $appTarBytes
+Patch-TarModes $appTarBytes '^bin/fn-docker-desk$|^web\.py$|^ui/index\.cgi$'
+# Gzip with custom header FNAME='app.tgz'
+$appTgzBytes = Compress-GzipCustom $appTarBytes -Fname "app.tgz"
+$appTgzPath = Join-Path $env:TEMP ("fn-app." + [guid]::NewGuid().ToString("N") + ".tgz")
 [System.IO.File]::WriteAllBytes($appTgzPath, $appTgzBytes)
+Write-Host ("app.tgz: entries={0}, tar_size={1}, tgz_size={2}" -f $ordered.Count, $appTarBytes.Length, $appTgzBytes.Length)
 
-# ---------- Build .fpk ----------
-$fpkEntries = @()
-$fpkEntries += [pscustomobject]@{ Path = Join-Path $FNOS "manifest"; ArcName = "manifest"; IsExec = $false }
-$fpkEntries += [pscustomobject]@{ Path = Join-Path $FNOS "ICON.PNG"; ArcName = "ICON.PNG"; IsExec = $false }
-$fpkEntries += [pscustomobject]@{ Path = Join-Path $FNOS "ICON_256.PNG"; ArcName = "ICON_256.PNG"; IsExec = $false }
-$fpkEntries += [pscustomobject]@{ Path = $appTgzPath; ArcName = "app.tgz"; IsExec = $false }
-$fpkEntries += Get-TreeEntries (Join-Path $FNOS "cmd") "cmd" $true
-$fpkEntries += Get-TreeEntries (Join-Path $FNOS "config") "config" $true
+# ============================================================
+# Section 4. Build outer .fpk
+# ============================================================
+$fpkStage = Join-Path $env:TEMP ("fn-fpk." + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $fpkStage -Force | Out-Null
+try {
+    Copy-Item (Join-Path $FNOS "manifest") (Join-Path $fpkStage "manifest") -Force
+    Copy-Item (Join-Path $FNOS "ICON.PNG") (Join-Path $fpkStage "ICON.PNG") -Force
+    Copy-Item (Join-Path $FNOS "ICON_256.PNG") (Join-Path $fpkStage "ICON_256.PNG") -Force
+    Copy-Item $appTgzPath (Join-Path $fpkStage "app.tgz") -Force
+    if (Test-Path (Join-Path $FNOS "cmd")) { Copy-Item (Join-Path $FNOS "cmd") (Join-Path $fpkStage "cmd") -Recurse -Force }
+    if (Test-Path (Join-Path $FNOS "config")) { Copy-Item (Join-Path $FNOS "config") (Join-Path $fpkStage "config") -Recurse -Force }
 
-$fpkTar = Build-Tar $fpkEntries
-$fpkBytes = Compress-Gzip $fpkTar
+    # Build ordered list — strict order: manifest → ICON.PNG → ICON_256.PNG → app.tgz → cmd/** → config/**
+    $ordered = @()
+    $ordered += [pscustomobject]@{ RelNative = "manifest"; Arc = "manifest" }
+    $ordered += [pscustomobject]@{ RelNative = "ICON.PNG"; Arc = "ICON.PNG" }
+    $ordered += [pscustomobject]@{ RelNative = "ICON_256.PNG"; Arc = "ICON_256.PNG" }
+    $ordered += [pscustomobject]@{ RelNative = "app.tgz"; Arc = "app.tgz" }
+    $ordered += @(Get-AlphaEntries "cmd" $fpkStage)
+    $ordered += @(Get-AlphaEntries "config" $fpkStage)
 
-$fpkOut = Join-Path $DIST "fn-docker-desk_${version}_all.fpk"
+    $fpkTarPath = Join-Path $env:TEMP ("fn-fpk-tar." + [guid]::NewGuid().ToString("N") + ".tar")
+    try {
+        for ($i = 0; $i -lt $ordered.Count; $i++) {
+            Add-TarEntry -TarPath $fpkTarPath -BaseDir $fpkStage -RelPath $ordered[$i].RelNative -IsFirst ($i -eq 0)
+        }
+        $fpkTarBytes = [System.IO.File]::ReadAllBytes($fpkTarPath)
+    } finally {
+        Remove-Item $fpkTarPath -Force -ErrorAction SilentlyContinue
+    }
+} finally {
+    Remove-Item $fpkStage -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $appTgzPath -Force -ErrorAction SilentlyContinue
+}
+# Patch outer PaxHeaders, then patch modes (exec = ^cmd/ ... everything else 0644)
+Patch-PaxHeaders $fpkTarBytes
+Patch-TarModes $fpkTarBytes '^cmd/'
+# Gzip with custom header FNAME=fn-docker-desk_X.Y.Z_all.fpk
+$fpkBytes = Compress-GzipCustom $fpkTarBytes -Fname $fpkBasename
+$fpkOut = Join-Path $DIST $fpkBasename
 [System.IO.File]::WriteAllBytes($fpkOut, $fpkBytes)
-Remove-Item $appTgzPath -Force -ErrorAction SilentlyContinue
-
 Write-Host ("Built: {0} ({1} bytes)" -f $fpkOut, $fpkBytes.Length)
 return $fpkOut
